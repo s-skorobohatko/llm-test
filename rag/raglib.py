@@ -23,10 +23,6 @@ def norm_text(s: str) -> str:
 
 
 def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[str]:
-    """
-    Chunker (by paragraphs) with overlap in characters.
-    Good enough for markdown + code; keeps logical blocks together.
-    """
     text = norm_text(text)
     if not text:
         return []
@@ -68,7 +64,6 @@ def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[st
     if cur:
         flush(cur)
 
-    # Apply overlap between chunks
     if overlap > 0 and len(chunks) > 1:
         out = [chunks[0]]
         for i in range(1, len(chunks)):
@@ -94,7 +89,6 @@ class OllamaClient:
         self.base_url = base_url.rstrip("/")
 
     def embed(self, model: str, text: str) -> List[float]:
-        # Ollama embeddings endpoint
         url = f"{self.base_url}/api/embeddings"
         resp = requests.post(url, json={"model": model, "prompt": text}, timeout=120)
         resp.raise_for_status()
@@ -171,13 +165,13 @@ def list_files_from_dir(path: str, pattern: str) -> List[str]:
     full = os.path.join(path, pattern)
     return [p for p in glob.glob(full, recursive=True) if os.path.isfile(p)]
 
+
 def list_files_multi_glob(root: str, patterns: List[str]) -> List[str]:
-    out = []
+    out: List[str] = []
     for pat in patterns:
         out.extend(list_files_from_dir(root, pat))
-    # uniq
     seen = set()
-    uniq = []
+    uniq: List[str] = []
     for p in out:
         if p not in seen:
             uniq.append(p)
@@ -194,7 +188,6 @@ def git_sync(url: str, dest: str) -> None:
 
 
 def load_text_file(path: str, max_bytes: int = 2_000_000) -> str:
-    # Avoid indexing huge files/binaries accidentally
     with open(path, "rb") as f:
         data = f.read(max_bytes + 1)
     if len(data) > max_bytes:
@@ -203,10 +196,6 @@ def load_text_file(path: str, max_bytes: int = 2_000_000) -> str:
 
 
 def ingest_sources(cfg: dict) -> List[Tuple[str, str]]:
-    """
-    Returns list of (source_name, file_path).
-    Source naming is fully controlled by config.yaml via src['name'].
-    """
     files: List[Tuple[str, str]] = []
     for src in cfg.get("sources", []):
         stype = src["type"]

@@ -35,7 +35,6 @@ sources:
     api_base: "https://forgeapi.puppet.com"
     dest: "./sources/forge/public"
 
-    # What to index from synced content
     include_globs:
       - "**/*.md"
       - "**/*.pp"
@@ -44,11 +43,17 @@ sources:
       - "REFERENCE.md"
       - "README*"
 
+    # Pagination / throttling
     limit_per_page: 50
-    max_modules: 200          # cap per run (increase later)
-    request_delay_sec: 0.2    # gentle rate limiting
+    request_delay_sec: 0.5          # slower = safer
+    download_delay_sec: 1.0         # add pause after each download/clone
 
-    # Filters (optional but recommended)
-    only_with_repo: true      # if true: only index modules with repo URL; tarball fallback disabled
-    # only_owner: "puppetlabs"  # uncomment to restrict
-    # require_supported: true   # if you decide to implement extra filter later
+    # Hard caps per run (VERY important)
+    max_modules_seen: 100           # how many modules to *scan* per run (API pages)
+    max_modules_synced: 20          # how many modules to actually download/clone per run
+
+    # Filters
+    only_owner: "puppetlabs"        # safest start
+    only_with_repo: true            # clone only, no tarball fallback
+    # allowlist: ["puppetlabs-stdlib", "puppetlabs-apt"]   # optional
+    # denylist: ["someowner-somemodule"]                   # optional
