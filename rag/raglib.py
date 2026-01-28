@@ -215,6 +215,10 @@ def ingest_sources(cfg: dict) -> List[Tuple[str, str]]:
             for fp in list_files_from_dir(d, pattern):
                 files.append((name, fp))
 
+        elif stype == "forge_discover":
+            # handled in ingest.py
+            continue
+
         else:
             raise ValueError(f"Unknown source type: {stype}")
 

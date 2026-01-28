@@ -14,8 +14,7 @@ GIT_URL_RE = re.compile(r"^(https?|git)://|^git@")
 def is_probable_git_repo(url: str) -> bool:
     if not url:
         return False
-    u = url.strip()
-    return bool(GIT_URL_RE.search(u))
+    return bool(GIT_URL_RE.search(url.strip()))
 
 
 def safe_mkdir(p: str) -> None:
@@ -36,7 +35,7 @@ def ensure_forge_state_table(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS forge_state (
             module_slug TEXT PRIMARY KEY,
             last_version TEXT,
-            last_kind TEXT,          -- "git" or "tar"
+            last_kind TEXT,
             last_checked INTEGER
         );
         """
@@ -51,8 +50,8 @@ def get_forge_state(conn: sqlite3.Connection, slug: str) -> Optional[Tuple[str, 
     ).fetchone()
     if not row:
         return None
-    last_version = row[0]
-    last_kind = row[1]
+    last_version = row[0] or ""
+    last_kind = row[1] or ""
     last_checked = int(row[2]) if row[2] is not None else 0
     return (last_version, last_kind, last_checked)
 
@@ -113,10 +112,7 @@ def safe_extract_tgz(tgz_path: str, dest_dir: str) -> None:
 
 
 def slug_to_paths(dest_root: str, slug: str) -> Tuple[str, str, str]:
-    """
-    Forge slug format is usually owner-name, e.g. puppetlabs-stdlib.
-    Split on the first dash to map into dest_root/owner/name.
-    """
+    # Forge slug usually "owner-name", split on first dash
     if "-" in slug:
         owner, name = slug.split("-", 1)
     else:
@@ -144,12 +140,17 @@ def discover_and_sync_forge(
 ) -> List[str]:
     """
     Discovers Forge modules and syncs them locally.
-    - If metadata.source looks like a repo URL => clone/pull
-    - Else (only_with_repo=false) => download tarball (current_release.file_uri) and extract
 
-    Skips already-synced modules (same release version).
-    Optional cooldown to reduce repeated checking.
-    Returns list of local directories that should be indexed in THIS run.
+    Strategy:
+      - If current_release.metadata.source looks like a git URL => clone/pull into <dest_root>/<owner>/<name>/repo
+      - Else (only_with_repo=false) => download tarball (current_release.file_uri) and extract into releases/<version>
+
+    Skipping:
+      - If module release version is unchanged => do NOT sync again
+      - If checked recently (check_interval_hours) => skip checking it again
+      - If index_unchanged=false => unchanged modules won't be returned for indexing
+
+    Returns: list of local directories to index *this run*.
     """
     safe_mkdir(dest_root)
     ensure_forge_state_table(conn)
@@ -175,8 +176,6 @@ def discover_and_sync_forge(
             slug = item.get("slug")
             if not slug:
                 continue
-
-            # We count "seen" as listing items processed
             seen += 1
 
             # allow/deny filters
@@ -185,11 +184,11 @@ def discover_and_sync_forge(
             if slug in denyset:
                 continue
 
-            # owner filter based on slug prefix
+            # owner filter
             if only_owner and not slug.startswith(f"{only_owner}-"):
                 continue
 
-            # Cooldown: skip checking module if it was checked recently
+            # cooldown on checks
             prev_state = get_forge_state(conn, slug)
             if prev_state and check_interval_hours > 0:
                 _, _, last_checked = prev_state
@@ -198,7 +197,7 @@ def discover_and_sync_forge(
                     if age < check_interval_hours * 3600:
                         continue
 
-            # Fetch details (release + metadata)
+            # fetch module details
             try:
                 mod = forge_get_module(api_base, slug)
             except Exception as e:
@@ -207,28 +206,24 @@ def discover_and_sync_forge(
                 continue
 
             current = mod.get("current_release") or {}
-            version = (current.get("version") or "").strip()
+            version = (current.get("version") or "").strip() or "unknown"
             metadata = current.get("metadata") or {}
             repo_url = (metadata.get("source") or "").strip()
             file_uri = (current.get("file_uri") or "").strip()
 
             use_git = is_probable_git_repo(repo_url)
 
-            # If repo-only mode, skip modules without repo
+            # repo-only mode
             if only_with_repo and not use_git:
-                # still update "last_checked" to avoid refetching soon
-                if version:
-                    kind = "git" if use_git else "tar"
-                    upsert_forge_state(conn, slug, version, kind)
-                    conn.commit()
+                upsert_forge_state(conn, slug, version, "tar" if file_uri else "unknown")
+                conn.commit()
                 time.sleep(request_delay_sec)
                 continue
 
+            # unchanged release => skip sync
             prev_state = get_forge_state(conn, slug)
-            if prev_state and prev_state[0] == version and version:
-                # unchanged release -> skip syncing
-                kind = prev_state[1] or ("git" if use_git else "tar")
-                upsert_forge_state(conn, slug, version, kind)
+            if prev_state and prev_state[0] == version:
+                upsert_forge_state(conn, slug, version, prev_state[1] or ("git" if use_git else "tar"))
                 conn.commit()
 
                 if index_unchanged:
@@ -245,34 +240,32 @@ def discover_and_sync_forge(
                 time.sleep(request_delay_sec)
                 continue
 
-            # Sync changed/new module
-            owner, name, base_dir = slug_to_paths(dest_root, slug)
+            # sync changed/new module
+            _, _, base_dir = slug_to_paths(dest_root, slug)
 
             try:
                 if use_git:
                     repo_dir = os.path.join(base_dir, "repo")
                     git_sync(repo_url, repo_dir)
-                    upsert_forge_state(conn, slug, version or "unknown", "git")
+                    upsert_forge_state(conn, slug, version, "git")
                     conn.commit()
                     synced_dirs.append(repo_dir)
                 else:
                     if not file_uri:
-                        # nothing we can do
-                        if version:
-                            upsert_forge_state(conn, slug, version, "tar")
-                            conn.commit()
+                        upsert_forge_state(conn, slug, version, "unknown")
+                        conn.commit()
                         time.sleep(request_delay_sec)
                         continue
 
                     dl_dir = os.path.join(base_dir, "downloads")
                     safe_mkdir(dl_dir)
-                    tgz_path = os.path.join(dl_dir, f"{slug}-{version or 'unknown'}.tar.gz")
+                    tgz_path = os.path.join(dl_dir, f"{slug}-{version}.tar.gz")
                     forge_download_file(api_base, file_uri, tgz_path)
 
-                    rel_dir = os.path.join(base_dir, "releases", version or "unknown")
+                    rel_dir = os.path.join(base_dir, "releases", version)
                     safe_extract_tgz(tgz_path, rel_dir)
 
-                    upsert_forge_state(conn, slug, version or "unknown", "tar")
+                    upsert_forge_state(conn, slug, version, "tar")
                     conn.commit()
                     synced_dirs.append(rel_dir)
 
@@ -286,12 +279,13 @@ def discover_and_sync_forge(
         offset += limit_per_page
         time.sleep(request_delay_sec)
 
-    # Deduplicate
+    # dedupe
     uniq: List[str] = []
     s = set()
     for d in synced_dirs:
         if d not in s:
             uniq.append(d)
             s.add(d)
+
     print(f"[forge] run summary: seen={seen}, synced={synced}, returned_dirs={len(uniq)}")
     return uniq
