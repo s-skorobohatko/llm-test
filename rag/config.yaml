@@ -20,12 +20,35 @@ sources:
     dest: "./sources/vendor/puppetlabs/best-practices"
     glob: "**/*.md"
 
-  - type: dir
-    name: "internal:control-repo"
-    path: "/srv/puppet/control-repo"
-    glob: "**/*.{pp,epp,md,yaml,yml,json}"
+  # - type: dir
+  #   name: "internal:control-repo"
+  #   path: "/srv/puppet/control-repo"
+  #   glob: "**/*.{pp,epp,md,yaml,yml,json}"
 
-  - type: dir
-    name: "internal:modules"
-    path: "/srv/puppet/modules"
-    glob: "**/*.{pp,epp,md}"
+  # - type: dir
+  #   name: "internal:modules"
+  #   path: "/srv/puppet/modules"
+  #   glob: "**/*.{pp,epp,md}"
+
+  - type: forge_discover
+    name: "forge:public:auto"
+    api_base: "https://forgeapi.puppet.com"
+    dest: "./sources/forge/public"
+
+    # What to index from synced content
+    include_globs:
+      - "**/*.md"
+      - "**/*.pp"
+      - "**/*.epp"
+      - "metadata.json"
+      - "REFERENCE.md"
+      - "README*"
+
+    limit_per_page: 50
+    max_modules: 200          # cap per run (increase later)
+    request_delay_sec: 0.2    # gentle rate limiting
+
+    # Filters (optional but recommended)
+    only_with_repo: true      # if true: only index modules with repo URL; tarball fallback disabled
+    # only_owner: "puppetlabs"  # uncomment to restrict
+    # require_supported: true   # if you decide to implement extra filter later

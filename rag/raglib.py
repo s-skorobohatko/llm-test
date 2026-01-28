@@ -171,6 +171,19 @@ def list_files_from_dir(path: str, pattern: str) -> List[str]:
     full = os.path.join(path, pattern)
     return [p for p in glob.glob(full, recursive=True) if os.path.isfile(p)]
 
+def list_files_multi_glob(root: str, patterns: List[str]) -> List[str]:
+    out = []
+    for pat in patterns:
+        out.extend(list_files_from_dir(root, pat))
+    # uniq
+    seen = set()
+    uniq = []
+    for p in out:
+        if p not in seen:
+            uniq.append(p)
+            seen.add(p)
+    return uniq
+
 
 def git_sync(url: str, dest: str) -> None:
     os.makedirs(os.path.dirname(dest), exist_ok=True)
