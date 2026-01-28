@@ -45,8 +45,8 @@ sources:
 
     # Pagination / throttling
     limit_per_page: 50
-    request_delay_sec: 0.5          # slower = safer
-    download_delay_sec: 1.0         # add pause after each download/clone
+    request_delay_sec: 1.0         # slower = safer
+    download_delay_sec: 3.0         # add pause after each download/clone
 
     # Hard caps per run (VERY important)
     max_modules_seen: 100           # how many modules to *scan* per run (API pages)
