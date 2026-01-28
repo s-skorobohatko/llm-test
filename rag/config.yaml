@@ -1,0 +1,31 @@
+ollama_url: "http://127.0.0.1:11434"
+
+embed_model: "nomic-embed-text"
+
+chat_model: "qwen3-puppet"
+
+db_path: "./rag.sqlite"
+
+
+chunk_size: 1200
+chunk_overlap: 200
+
+top_k: 6
+min_sim: 0.18
+
+sources:
+  - type: git
+    name: "vendor:puppetlabs:best-practices"
+    url: "https://github.com/puppetlabs/best-practices.git"
+    dest: "./sources/vendor/puppetlabs/best-practices"
+    glob: "**/*.md"
+
+  - type: dir
+    name: "internal:control-repo"
+    path: "/srv/puppet/control-repo"
+    glob: "**/*.{pp,epp,md,yaml,yml,json}"
+
+  - type: dir
+    name: "internal:modules"
+    path: "/srv/puppet/modules"
+    glob: "**/*.{pp,epp,md}"
