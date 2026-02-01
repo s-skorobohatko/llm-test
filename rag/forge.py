@@ -1,8 +1,8 @@
 import os
 import re
 import time
+import json
 import tarfile
-import sqlite3
 import requests
 import subprocess
 from typing import Dict, Any, List, Optional, Tuple
@@ -21,53 +21,54 @@ def safe_mkdir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 
+def atomic_write_json(path: str, obj: dict) -> None:
+    safe_mkdir(os.path.dirname(path))
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def load_state(path: str) -> dict:
+    if not path or not os.path.isfile(path):
+        return {"modules": {}}
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except Exception:
+            return {"modules": {}}
+
+
+def save_state(path: str, state: dict) -> None:
+    atomic_write_json(path, state)
+
+
+def get_state_entry(state: dict, slug: str) -> Optional[Tuple[str, str, int]]:
+    ent = (state.get("modules") or {}).get(slug)
+    if not ent:
+        return None
+    return (
+        ent.get("last_version", "") or "",
+        ent.get("last_kind", "") or "",
+        int(ent.get("last_checked", 0) or 0),
+    )
+
+
+def upsert_state_entry(state: dict, slug: str, version: str, kind: str) -> None:
+    mods = state.setdefault("modules", {})
+    mods[slug] = {
+        "last_version": version,
+        "last_kind": kind,
+        "last_checked": int(time.time()),
+    }
+
+
 def git_sync(url: str, dest: str) -> None:
     safe_mkdir(os.path.dirname(dest))
     if os.path.isdir(dest) and os.path.isdir(os.path.join(dest, ".git")):
         subprocess.check_call(["git", "-C", dest, "pull", "--ff-only"])
     else:
         subprocess.check_call(["git", "clone", "--depth", "1", url, dest])
-
-
-def ensure_forge_state_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS forge_state (
-            module_slug TEXT PRIMARY KEY,
-            last_version TEXT,
-            last_kind TEXT,
-            last_checked INTEGER
-        );
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_forge_state_checked ON forge_state(last_checked);")
-
-
-def get_forge_state(conn: sqlite3.Connection, slug: str) -> Optional[Tuple[str, str, int]]:
-    row = conn.execute(
-        "SELECT last_version, last_kind, last_checked FROM forge_state WHERE module_slug=?",
-        (slug,),
-    ).fetchone()
-    if not row:
-        return None
-    last_version = row[0] or ""
-    last_kind = row[1] or ""
-    last_checked = int(row[2]) if row[2] is not None else 0
-    return (last_version, last_kind, last_checked)
-
-
-def upsert_forge_state(conn: sqlite3.Connection, slug: str, version: str, kind: str) -> None:
-    conn.execute(
-        """
-        INSERT INTO forge_state(module_slug, last_version, last_kind, last_checked)
-        VALUES(?, ?, ?, ?)
-        ON CONFLICT(module_slug) DO UPDATE SET
-          last_version=excluded.last_version,
-          last_kind=excluded.last_kind,
-          last_checked=excluded.last_checked
-        """,
-        (slug, version, kind, int(time.time())),
-    )
 
 
 def forge_list_modules(api_base: str, limit: int, offset: int) -> Dict[str, Any]:
@@ -112,7 +113,6 @@ def safe_extract_tgz(tgz_path: str, dest_dir: str) -> None:
 
 
 def slug_to_paths(dest_root: str, slug: str) -> Tuple[str, str, str]:
-    # Forge slug usually "owner-name", split on first dash
     if "-" in slug:
         owner, name = slug.split("-", 1)
     else:
@@ -122,10 +122,10 @@ def slug_to_paths(dest_root: str, slug: str) -> Tuple[str, str, str]:
 
 
 def discover_and_sync_forge(
-    conn: sqlite3.Connection,
     api_base: str,
     dest_root: str,
     include_globs: List[str],
+    state_file: str,
     limit_per_page: int = 50,
     max_modules_seen: int = 500,
     max_modules_synced: int = 50,
@@ -138,22 +138,9 @@ def discover_and_sync_forge(
     index_unchanged: bool = False,
     check_interval_hours: int = 24,
 ) -> List[str]:
-    """
-    Discovers Forge modules and syncs them locally.
-
-    Strategy:
-      - If current_release.metadata.source looks like a git URL => clone/pull into <dest_root>/<owner>/<name>/repo
-      - Else (only_with_repo=false) => download tarball (current_release.file_uri) and extract into releases/<version>
-
-    Skipping:
-      - If module release version is unchanged => do NOT sync again
-      - If checked recently (check_interval_hours) => skip checking it again
-      - If index_unchanged=false => unchanged modules won't be returned for indexing
-
-    Returns: list of local directories to index *this run*.
-    """
     safe_mkdir(dest_root)
-    ensure_forge_state_table(conn)
+
+    state = load_state(state_file)
 
     allowset = set(allowlist or [])
     denyset = set(denylist or [])
@@ -178,26 +165,21 @@ def discover_and_sync_forge(
                 continue
             seen += 1
 
-            # allow/deny filters
             if allowset and slug not in allowset:
                 continue
             if slug in denyset:
                 continue
-
-            # owner filter
             if only_owner and not slug.startswith(f"{only_owner}-"):
                 continue
 
-            # cooldown on checks
-            prev_state = get_forge_state(conn, slug)
-            if prev_state and check_interval_hours > 0:
-                _, _, last_checked = prev_state
+            prev = get_state_entry(state, slug)
+            if prev and check_interval_hours > 0:
+                _, _, last_checked = prev
                 if last_checked:
                     age = int(time.time()) - int(last_checked)
                     if age < check_interval_hours * 3600:
                         continue
 
-            # fetch module details
             try:
                 mod = forge_get_module(api_base, slug)
             except Exception as e:
@@ -213,18 +195,16 @@ def discover_and_sync_forge(
 
             use_git = is_probable_git_repo(repo_url)
 
-            # repo-only mode
             if only_with_repo and not use_git:
-                upsert_forge_state(conn, slug, version, "tar" if file_uri else "unknown")
-                conn.commit()
+                upsert_state_entry(state, slug, version, "tar" if file_uri else "unknown")
+                save_state(state_file, state)
                 time.sleep(request_delay_sec)
                 continue
 
-            # unchanged release => skip sync
-            prev_state = get_forge_state(conn, slug)
-            if prev_state and prev_state[0] == version:
-                upsert_forge_state(conn, slug, version, prev_state[1] or ("git" if use_git else "tar"))
-                conn.commit()
+            prev = get_state_entry(state, slug)
+            if prev and prev[0] == version:
+                upsert_state_entry(state, slug, version, prev[1] or ("git" if use_git else "tar"))
+                save_state(state_file, state)
 
                 if index_unchanged:
                     _, _, base_dir = slug_to_paths(dest_root, slug)
@@ -240,20 +220,19 @@ def discover_and_sync_forge(
                 time.sleep(request_delay_sec)
                 continue
 
-            # sync changed/new module
             _, _, base_dir = slug_to_paths(dest_root, slug)
 
             try:
                 if use_git:
                     repo_dir = os.path.join(base_dir, "repo")
                     git_sync(repo_url, repo_dir)
-                    upsert_forge_state(conn, slug, version, "git")
-                    conn.commit()
+                    upsert_state_entry(state, slug, version, "git")
+                    save_state(state_file, state)
                     synced_dirs.append(repo_dir)
                 else:
                     if not file_uri:
-                        upsert_forge_state(conn, slug, version, "unknown")
-                        conn.commit()
+                        upsert_state_entry(state, slug, version, "unknown")
+                        save_state(state_file, state)
                         time.sleep(request_delay_sec)
                         continue
 
@@ -265,8 +244,8 @@ def discover_and_sync_forge(
                     rel_dir = os.path.join(base_dir, "releases", version)
                     safe_extract_tgz(tgz_path, rel_dir)
 
-                    upsert_forge_state(conn, slug, version, "tar")
-                    conn.commit()
+                    upsert_state_entry(state, slug, version, "tar")
+                    save_state(state_file, state)
                     synced_dirs.append(rel_dir)
 
                 synced += 1

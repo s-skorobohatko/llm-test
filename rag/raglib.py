@@ -1,14 +1,10 @@
 import os
 import re
 import glob
-import time
-import sqlite3
 import hashlib
 import subprocess
-from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 
-import numpy as np
 import requests
 
 
@@ -75,25 +71,15 @@ def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[st
     return chunks
 
 
-@dataclass
-class DocChunk:
-    source: str
-    path: str
-    chunk_index: int
-    content: str
-    content_hash: str
-
-
 class OllamaClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
 
     def embed(self, model: str, text: str) -> List[float]:
         url = f"{self.base_url}/api/embeddings"
-        resp = requests.post(url, json={"model": model, "prompt": text}, timeout=120)
+        resp = requests.post(url, json={"model": model, "prompt": text}, timeout=180)
         resp.raise_for_status()
-        data = resp.json()
-        return data["embedding"]
+        return resp.json()["embedding"]
 
     def chat(
         self,
@@ -101,7 +87,11 @@ class OllamaClient:
         system: str,
         user: str,
         options: Optional[Dict[str, Any]] = None,
+        stream: bool = False,
+        timeout: int = 3600,
     ) -> str:
+        import json
+
         url = f"{self.base_url}/api/chat"
         payload: Dict[str, Any] = {
             "model": model,
@@ -109,56 +99,31 @@ class OllamaClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "stream": False,
+            "stream": stream,
         }
         if options:
             payload["options"] = options
 
-        resp = requests.post(url, json=payload, timeout=600)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["message"]["content"]
+        if not stream:
+            resp = requests.post(url, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()["message"]["content"]
 
-
-def ensure_db(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source TEXT NOT NULL,
-            path TEXT NOT NULL,
-            chunk_index INTEGER NOT NULL,
-            content TEXT NOT NULL,
-            content_hash TEXT NOT NULL,
-            embedding BLOB NOT NULL,
-            dim INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            UNIQUE(path, chunk_index, content_hash)
-        );
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);")
-    return conn
-
-
-def to_blob(vec: np.ndarray) -> bytes:
-    vec = vec.astype(np.float32)
-    return vec.tobytes()
-
-
-def from_blob(blob: bytes, dim: int) -> np.ndarray:
-    return np.frombuffer(blob, dtype=np.float32, count=dim)
-
-
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    na = float(np.linalg.norm(a))
-    nb = float(np.linalg.norm(b))
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
+        out = []
+        with requests.post(url, json=payload, stream=True, timeout=timeout) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                obj = json.loads(line)
+                msg = obj.get("message", {}).get("content", "")
+                if msg:
+                    print(msg, end="", flush=True)
+                    out.append(msg)
+                if obj.get("done") is True:
+                    break
+        print()
+        return "".join(out)
 
 
 def list_files_from_dir(path: str, pattern: str) -> List[str]:
@@ -184,7 +149,7 @@ def git_sync(url: str, dest: str) -> None:
     if os.path.isdir(dest) and os.path.isdir(os.path.join(dest, ".git")):
         subprocess.check_call(["git", "-C", dest, "pull", "--ff-only"])
     else:
-        subprocess.check_call(["git", "clone", url, dest])
+        subprocess.check_call(["git", "clone", "--depth", "1", url, dest])
 
 
 def load_text_file(path: str, max_bytes: int = 2_000_000) -> str:

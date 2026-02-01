@@ -1,7 +1,7 @@
 ollama_url: "http://127.0.0.1:11434"
 
 embed_model: "nomic-embed-text"
-chat_model: "qwen3-puppet"
+chat_model: "puppet-expert"
 
 vector_store: "qdrant"
 qdrant_url: "http://127.0.0.1:6333"
