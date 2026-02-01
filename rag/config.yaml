@@ -45,13 +45,13 @@ sources:
       - "README*"
 
     # Pagination / throttling
-    limit_per_page: 50
+    limit_per_page: 20
     request_delay_sec: 1.0
     download_delay_sec: 3.0
 
     # Hard caps per run
     max_modules_seen: 100
-    max_modules_synced: 20
+    max_modules_synced: 30
 
     # Filters
     only_owner: "puppetlabs"
@@ -62,4 +62,4 @@ sources:
     check_interval_hours: 24
 
     # allowlist: ["puppetlabs-stdlib", "puppetlabs-apt"]
-    # denylist: ["someowner-somemodule"]
+    denylist: ["puppetlabs-java"]
