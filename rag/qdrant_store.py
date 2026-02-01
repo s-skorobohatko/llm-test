@@ -1,84 +1,42 @@
-import time
-import uuid
-import requests
 from typing import Any, Dict, List, Optional, Tuple
 
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qm
 
-def _point_id(path: str, chunk_index: int, content_hash: str) -> str:
-    s = f"{path}#{chunk_index}#{content_hash}"
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, s))
+
+def _field_condition(cond: Dict[str, Any]) -> qm.FieldCondition:
+    """
+    Convert a simple dict to Qdrant FieldCondition.
+    Supports:
+      {"key":"source","match":{"value":"internal:module:iptables"}}  (exact)
+      {"key":"path","match":{"text":"/opt/llm/llm-test/iptables"}}  (substring)
+    """
+    key = cond["key"]
+    m = cond["match"]
+    if "value" in m:
+        return qm.FieldCondition(key=key, match=qm.MatchValue(value=m["value"]))
+    if "text" in m:
+        return qm.FieldCondition(key=key, match=qm.MatchText(text=m["text"]))
+    raise ValueError(f"Unsupported match in condition: {cond}")
 
 
 class QdrantStore:
     def __init__(self, url: str, collection: str):
-        self.url = url.rstrip("/")
+        self.client = QdrantClient(url=url)
         self.collection = collection
 
-    def _c(self, suffix: str) -> str:
-        return f"{self.url}/collections/{self.collection}{suffix}"
-
-    def collection_exists(self) -> bool:
-        r = requests.get(f"{self.url}/collections/{self.collection}", timeout=30)
-        return r.status_code == 200
-
-    def create_collection(self, dim: int) -> None:
-        payload = {"vectors": {"size": dim, "distance": "Cosine"}}
-        r = requests.put(f"{self.url}/collections/{self.collection}", json=payload, timeout=60)
-        r.raise_for_status()
-
     def ensure_collection(self, dim: int) -> None:
-        if not self.collection_exists():
-            self.create_collection(dim)
+        """
+        Create collection if missing, using cosine distance.
+        """
+        cols = self.client.get_collections().collections
+        if any(c.name == self.collection for c in cols):
+            return
 
-    def upsert_points(self, points: List[Dict[str, Any]]) -> None:
-        r = requests.put(self._c("/points"), json={"points": points}, timeout=180)
-        r.raise_for_status()
-
-    def search(
-        self,
-        query_vector: List[float],
-        top_k: int,
-        min_sim: float,
-        must: Optional[List[Dict[str, Any]]] = None,
-        should: Optional[List[Dict[str, Any]]] = None,
-        must_not: Optional[List[Dict[str, Any]]] = None,
-    ) -> List[Tuple[float, Dict[str, Any]]]:
-        q: Dict[str, Any] = {
-            "vector": query_vector,
-            "limit": top_k,
-            "with_payload": True,
-        }
-        filt: Dict[str, Any] = {}
-        if must:
-            filt["must"] = must
-        if should:
-            filt["should"] = should
-        if must_not:
-            filt["must_not"] = must_not
-        if filt:
-            q["filter"] = filt
-
-        r = requests.post(self._c("/points/search"), json=q, timeout=120)
-        r.raise_for_status()
-        data = r.json()
-
-        out: List[Tuple[float, Dict[str, Any]]] = []
-        for item in data.get("result", []):
-            score = float(item.get("score", 0.0))
-            if score < min_sim:
-                continue
-            payload = item.get("payload") or {}
-            out.append((score, payload))
-        return out
-
-    def count(self, must: Optional[List[Dict[str, Any]]] = None) -> int:
-        payload: Dict[str, Any] = {"exact": True}
-        if must:
-            payload["filter"] = {"must": must}
-
-        r = requests.post(self._c("/points/count"), json=payload, timeout=60)
-        r.raise_for_status()
-        return int(r.json().get("result", {}).get("count", 0))
+        self.client.create_collection(
+            collection_name=self.collection,
+            vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
+        )
 
     def make_point(
         self,
@@ -88,16 +46,58 @@ class QdrantStore:
         content: str,
         content_hash: str,
         vector: List[float],
-    ) -> Dict[str, Any]:
-        return {
-            "id": _point_id(path, chunk_index, content_hash),
-            "vector": vector,
-            "payload": {
-                "source": source,
-                "path": path,
-                "chunk_index": chunk_index,
-                "content": content,
-                "content_hash": content_hash,
-                "created_at": int(time.time()),
-            },
+    ) -> qm.PointStruct:
+        """
+        Create a Qdrant point with payload for RAG.
+        """
+        point_id = content_hash  # stable id, overwritten on upsert
+        payload = {
+            "source": source,
+            "path": path,
+            "chunk_index": chunk_index,
+            "content": content,
+            "content_hash": content_hash,
         }
+        return qm.PointStruct(id=point_id, vector=vector, payload=payload)
+
+    def upsert_points(self, points: List[qm.PointStruct]) -> None:
+        self.client.upsert(collection_name=self.collection, points=points)
+
+    def count(self, must: Optional[List[Dict[str, Any]]] = None) -> int:
+        """
+        Count points, optionally filtered by must conditions.
+        """
+        flt = None
+        if must:
+            flt = qm.Filter(must=[_field_condition(c) for c in must])
+        res = self.client.count(collection_name=self.collection, count_filter=flt, exact=True)
+        return int(res.count)
+
+    def search(
+        self,
+        query_vector: List[float],
+        top_k: int,
+        min_sim: float,
+        must: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Tuple[float, Dict[str, Any]]]:
+        """
+        Vector search with optional must filter.
+        Returns list of (score, payload).
+        """
+        flt = None
+        if must:
+            flt = qm.Filter(must=[_field_condition(c) for c in must])
+
+        hits = self.client.search(
+            collection_name=self.collection,
+            query_vector=query_vector,
+            limit=top_k,
+            with_payload=True,
+            score_threshold=min_sim,
+            query_filter=flt,
+        )
+
+        out: List[Tuple[float, Dict[str, Any]]] = []
+        for h in hits:
+            out.append((float(h.score), dict(h.payload or {})))
+        return out
