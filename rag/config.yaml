@@ -21,13 +21,13 @@ sources:
   - type: dir
     name: "internal:module:iptables"
     path: "/opt/llm/llm-test/iptables"
-    glob: "**/*.{pp,epp,md,yaml,yml,json}"
+    glob: "**/*"
 
   - type: git
     name: "vendor:puppetlabs:best-practices"
     url: "https://github.com/puppetlabs/best-practices.git"
     dest: "./sources/vendor/puppetlabs/best-practices"
-    glob: "**/*.{md,markdown,MD}"
+    glob: "**/*.md"
 
   # - type: dir
   #   name: "internal:control-repo"
