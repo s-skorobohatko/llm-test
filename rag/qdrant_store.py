@@ -8,8 +8,8 @@ def _field_condition(cond: Dict[str, Any]) -> qm.FieldCondition:
     """
     Convert a simple dict to Qdrant FieldCondition.
     Supports:
-      {"key":"source","match":{"value":"internal:module:iptables"}}  (exact)
-      {"key":"path","match":{"text":"/opt/llm/llm-test/iptables"}}  (substring)
+      {"key":"source","match":{"value":"vendor:puppetlabs:best-practices"}}  (exact)
+      {"key":"path","match":{"text":"/opt/llm/llm-test/iptables"}}           (substring)
     """
     key = cond["key"]
     m = cond["match"]
@@ -20,15 +20,18 @@ def _field_condition(cond: Dict[str, Any]) -> qm.FieldCondition:
     raise ValueError(f"Unsupported match in condition: {cond}")
 
 
+def _make_filter(must: Optional[List[Dict[str, Any]]]) -> Optional[qm.Filter]:
+    if not must:
+        return None
+    return qm.Filter(must=[_field_condition(c) for c in must])
+
+
 class QdrantStore:
     def __init__(self, url: str, collection: str):
         self.client = QdrantClient(url=url)
         self.collection = collection
 
     def ensure_collection(self, dim: int) -> None:
-        """
-        Create collection if missing, using cosine distance.
-        """
         cols = self.client.get_collections().collections
         if any(c.name == self.collection for c in cols):
             return
@@ -38,38 +41,11 @@ class QdrantStore:
             vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
         )
 
-    def make_point(
-        self,
-        source: str,
-        path: str,
-        chunk_index: int,
-        content: str,
-        content_hash: str,
-        vector: List[float],
-    ) -> qm.PointStruct:
-        """
-        Create a Qdrant point with payload for RAG.
-        """
-        point_id = content_hash  # stable id, overwritten on upsert
-        payload = {
-            "source": source,
-            "path": path,
-            "chunk_index": chunk_index,
-            "content": content,
-            "content_hash": content_hash,
-        }
-        return qm.PointStruct(id=point_id, vector=vector, payload=payload)
-
     def upsert_points(self, points: List[qm.PointStruct]) -> None:
         self.client.upsert(collection_name=self.collection, points=points)
 
     def count(self, must: Optional[List[Dict[str, Any]]] = None) -> int:
-        """
-        Count points, optionally filtered by must conditions.
-        """
-        flt = None
-        if must:
-            flt = qm.Filter(must=[_field_condition(c) for c in must])
+        flt = _make_filter(must)
         res = self.client.count(collection_name=self.collection, count_filter=flt, exact=True)
         return int(res.count)
 
@@ -81,23 +57,97 @@ class QdrantStore:
         must: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Tuple[float, Dict[str, Any]]]:
         """
-        Vector search with optional must filter.
-        Returns list of (score, payload).
+        Return list of (score, payload).
+        Compatible with multiple qdrant-client API variants.
         """
-        flt = None
-        if must:
-            flt = qm.Filter(must=[_field_condition(c) for c in must])
+        flt = _make_filter(must)
 
-        hits = self.client.search(
-            collection_name=self.collection,
-            query_vector=query_vector,
+        # Variant A: classic client.search(...)
+        if hasattr(self.client, "search"):
+            hits = self.client.search(
+                collection_name=self.collection,
+                query_vector=query_vector,
+                limit=top_k,
+                with_payload=True,
+                score_threshold=min_sim,
+                query_filter=flt,
+            )
+            return [(float(h.score), dict(h.payload or {})) for h in hits]
+
+        # Variant B: newer client.query_points(...)
+        # Some versions use "query" or "vector" naming; we handle both by trying.
+        if hasattr(self.client, "query_points"):
+            try:
+                res = self.client.query_points(
+                    collection_name=self.collection,
+                    query=query_vector,            # some versions
+                    limit=top_k,
+                    with_payload=True,
+                    score_threshold=min_sim,
+                    query_filter=flt,
+                )
+            except TypeError:
+                # alternate signature
+                res = self.client.query_points(
+                    collection_name=self.collection,
+                    vector=query_vector,           # some versions
+                    limit=top_k,
+                    with_payload=True,
+                    score_threshold=min_sim,
+                    query_filter=flt,
+                )
+
+            # res can be object with .points or list-like depending on version
+            points = getattr(res, "points", res)
+            out = []
+            for p in points:
+                score = getattr(p, "score", None)
+                payload = getattr(p, "payload", None)
+                if score is None and isinstance(p, dict):
+                    score = p.get("score")
+                    payload = p.get("payload")
+                out.append((float(score), dict(payload or {})))
+            return out
+
+        # Variant C: client.search_points(...)
+        if hasattr(self.client, "search_points"):
+            try:
+                res = self.client.search_points(
+                    collection_name=self.collection,
+                    vector=query_vector,
+                    limit=top_k,
+                    with_payload=True,
+                    score_threshold=min_sim,
+                    query_filter=flt,
+                )
+            except TypeError:
+                res = self.client.search_points(
+                    collection_name=self.collection,
+                    query_vector=query_vector,
+                    limit=top_k,
+                    with_payload=True,
+                    score_threshold=min_sim,
+                    query_filter=flt,
+                )
+
+            points = getattr(res, "points", res)
+            out = []
+            for p in points:
+                score = getattr(p, "score", None)
+                payload = getattr(p, "payload", None)
+                out.append((float(score), dict(payload or {})))
+            return out
+
+        # Variant D: very old low-level HTTP API
+        req = qm.SearchRequest(
+            vector=query_vector,
             limit=top_k,
             with_payload=True,
             score_threshold=min_sim,
-            query_filter=flt,
+            filter=flt,
         )
-
-        out: List[Tuple[float, Dict[str, Any]]] = []
-        for h in hits:
-            out.append((float(h.score), dict(h.payload or {})))
-        return out
+        hits = self.client.http.search(
+            collection_name=self.collection,
+            search_request=req,
+        )
+        return [(float(h.score), dict(h.payload or {})) for h in hits]
