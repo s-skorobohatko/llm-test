@@ -71,6 +71,15 @@ class QdrantStore:
             out.append((score, payload))
         return out
 
+    def count(self, must: Optional[List[Dict[str, Any]]] = None) -> int:
+        payload: Dict[str, Any] = {"exact": True}
+        if must:
+            payload["filter"] = {"must": must}
+
+        r = requests.post(self._c("/points/count"), json=payload, timeout=60)
+        r.raise_for_status()
+        return int(r.json().get("result", {}).get("count", 0))
+
     def make_point(
         self,
         source: str,
