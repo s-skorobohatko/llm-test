@@ -54,13 +54,13 @@ sources:
       - "README*"
 
     # Pagination / throttling
-    limit_per_page: 20
+    limit_per_page: 30
     request_delay_sec: 1.0
     download_delay_sec: 3.0
 
     # Hard caps per run
     max_modules_seen: 100
-    max_modules_synced: 30
+    max_modules_synced: 40
 
     # Filters
     only_owner: "puppetlabs"
