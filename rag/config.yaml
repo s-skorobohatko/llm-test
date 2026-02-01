@@ -29,6 +29,10 @@ sources:
   #   name: "internal:modules"
   #   path: "/srv/puppet/modules"
   #   glob: "**/*.{pp,epp,md}"
+  - type: dir
+    name: "internal:module:iptables"
+    path: "/opt/llm/llm-test/iptables"
+    glob: "**/*.{pp,epp,md,yaml,yml,json}"
 
   - type: forge_discover
     name: "forge:public:auto"
