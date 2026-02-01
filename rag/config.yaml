@@ -14,6 +14,11 @@ top_k: 6
 min_sim: 0.18
 
 sources:
+  - type: dir
+    name: "internal:module:iptables"
+    path: "/opt/llm/llm-test/iptables"
+    glob: "**/*.{pp,epp,md,yaml,yml,json}"
+
   - type: git
     name: "vendor:puppetlabs:best-practices"
     url: "https://github.com/puppetlabs/best-practices.git"
@@ -29,10 +34,6 @@ sources:
   #   name: "internal:modules"
   #   path: "/srv/puppet/modules"
   #   glob: "**/*.{pp,epp,md}"
-  - type: dir
-    name: "internal:module:iptables"
-    path: "/opt/llm/llm-test/iptables"
-    glob: "**/*.{pp,epp,md,yaml,yml,json}"
 
   - type: forge_discover
     name: "forge:public:auto"
