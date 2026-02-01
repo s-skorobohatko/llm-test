@@ -1,11 +1,11 @@
 ollama_url: "http://127.0.0.1:11434"
 
 embed_model: "nomic-embed-text"
-
 chat_model: "qwen3-puppet"
 
-db_path: "./rag.sqlite"
-
+vector_store: "qdrant"
+qdrant_url: "http://127.0.0.1:6333"
+qdrant_collection: "puppet_chunks"
 
 chunk_size: 1200
 chunk_overlap: 200
@@ -18,7 +18,7 @@ sources:
     name: "vendor:puppetlabs:best-practices"
     url: "https://github.com/puppetlabs/best-practices.git"
     dest: "./sources/vendor/puppetlabs/best-practices"
-    glob: "**/*.md"
+    glob: "**/*.{md,markdown,MD}"
 
   # - type: dir
   #   name: "internal:control-repo"
@@ -34,6 +34,7 @@ sources:
     name: "forge:public:auto"
     api_base: "https://forgeapi.puppet.com"
     dest: "./sources/forge/public"
+    state_file: "./sources/forge/public/.state/forge_state.json"
 
     include_globs:
       - "**/*.md"
@@ -45,15 +46,20 @@ sources:
 
     # Pagination / throttling
     limit_per_page: 50
-    request_delay_sec: 1.0         # slower = safer
-    download_delay_sec: 3.0         # add pause after each download/clone
+    request_delay_sec: 1.0
+    download_delay_sec: 3.0
 
-    # Hard caps per run (VERY important)
-    max_modules_seen: 100           # how many modules to *scan* per run (API pages)
-    max_modules_synced: 20          # how many modules to actually download/clone per run
+    # Hard caps per run
+    max_modules_seen: 100
+    max_modules_synced: 20
 
     # Filters
-    only_owner: "puppetlabs"        # safest start
-    only_with_repo: true            # clone only, no tarball fallback
-    # allowlist: ["puppetlabs-stdlib", "puppetlabs-apt"]   # optional
-    # denylist: ["someowner-somemodule"]                   # optional
+    only_owner: "puppetlabs"
+    only_with_repo: true
+
+    # Skip behavior (IMPORTANT)
+    index_unchanged: false
+    check_interval_hours: 24
+
+    # allowlist: ["puppetlabs-stdlib", "puppetlabs-apt"]
+    # denylist: ["someowner-somemodule"]
