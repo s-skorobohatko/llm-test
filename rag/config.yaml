@@ -71,4 +71,4 @@ sources:
     check_interval_hours: 24
 
     # allowlist: ["puppetlabs-stdlib", "puppetlabs-apt"]
-    denylist: ["puppetlabs-java"]
+    denylist: ["puppetlabs-java", "puppetlabs-nodejs", "puppetlabs-ruby", "puppetlabs-mysql", "puppetlabs-reboot", "puppetlabs-pe_gem", "puppetlabs-gcc"]
