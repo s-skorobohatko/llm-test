@@ -151,12 +151,14 @@ RAG-FIRST RULES:
 TASK:
 {question}
 """
-
+    print("\n=== Answer (streaming) ===")
     answer = client.chat(
         model=chat_model,
         messages=[{"role": "user", "content": user_prompt}],
-        # options={"num_predict": 3000},
+        stream=True,           # ✅ enable streaming
+        stream_print=True,     # ✅ print tokens live
     )
+    print("\n") 
 
     dt = time.time() - t0
     print("\n=== Answer ===")

@@ -1,3 +1,4 @@
+import json
 import requests
 
 
@@ -10,34 +11,66 @@ class OllamaClient:
         payload = {"model": model, "prompt": text}
         resp = requests.post(url, json=payload, timeout=600)
         resp.raise_for_status()
-        data = resp.json()
-        return data["embedding"]
+        return resp.json()["embedding"]
 
-    def chat(self, model: str, prompt: str = None, messages=None, system: str = None, options: dict = None):
+    def chat(
+        self,
+        model: str,
+        prompt: str = None,
+        messages=None,
+        system: str = None,
+        options: dict = None,
+        stream: bool = False,
+        stream_print: bool = True,
+    ) -> str:
         """
-        Compatibility chat:
-        - If messages is provided, uses /api/chat with messages.
-        - Else uses /api/generate with prompt (and optional system).
+        If messages is provided -> /api/chat
+        else -> /api/generate
 
-        Returns: response text string
+        stream=True prints tokens live (if stream_print=True) and returns full text.
         """
         options = options or {}
 
+        # --- CHAT endpoint (messages) ---
         if messages is not None:
             url = f"{self.base_url}/api/chat"
             payload = {
                 "model": model,
                 "messages": messages,
-                "stream": False,
+                "stream": bool(stream),
                 "options": options,
             }
-            resp = requests.post(url, json=payload, timeout=600)
-            resp.raise_for_status()
-            data = resp.json()
-            # Ollama chat response shape: {"message":{"role":"assistant","content":"..."}, ...}
-            return data.get("message", {}).get("content", "")
 
-        # fallback: generate endpoint
+            if not stream:
+                resp = requests.post(url, json=payload, timeout=3600)
+                resp.raise_for_status()
+                data = resp.json()
+                return data.get("message", {}).get("content", "")
+
+            # streaming mode
+            resp = requests.post(url, json=payload, stream=True, timeout=3600)
+            resp.raise_for_status()
+
+            out_chunks = []
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                data = json.loads(line)
+
+                # Each chunk has {"message":{"role":"assistant","content":"..."}, "done":false}
+                msg = data.get("message") or {}
+                piece = msg.get("content") or ""
+                if piece:
+                    out_chunks.append(piece)
+                    if stream_print:
+                        print(piece, end="", flush=True)
+
+                if data.get("done") is True:
+                    break
+
+            return "".join(out_chunks)
+
+        # --- GENERATE endpoint (prompt) ---
         if prompt is None:
             raise TypeError("chat() requires either prompt=... or messages=[...]")
 
@@ -45,14 +78,34 @@ class OllamaClient:
         payload = {
             "model": model,
             "prompt": prompt,
-            "stream": False,
+            "stream": bool(stream),
             "options": options,
         }
         if system:
             payload["system"] = system
 
-        resp = requests.post(url, json=payload, timeout=600)
+        if not stream:
+            resp = requests.post(url, json=payload, timeout=3600)
+            resp.raise_for_status()
+            return resp.json().get("response", "")
+
+        resp = requests.post(url, json=payload, stream=True, timeout=3600)
         resp.raise_for_status()
-        data = resp.json()
-        # Ollama generate response shape: {"response":"...", ...}
-        return data.get("response", "")
+
+        out_chunks = []
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            data = json.loads(line)
+
+            # generate stream chunks have {"response":"...", "done":false}
+            piece = data.get("response") or ""
+            if piece:
+                out_chunks.append(piece)
+                if stream_print:
+                    print(piece, end="", flush=True)
+
+            if data.get("done") is True:
+                break
+
+        return "".join(out_chunks)
