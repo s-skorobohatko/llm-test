@@ -46,7 +46,6 @@ sources:
     state_file: "./sources/forge/public/.state/forge_state.json"
 
     include_globs:
-      - "**/*.md"
       - "**/*.pp"
       - "**/*.epp"
       - "metadata.json"
