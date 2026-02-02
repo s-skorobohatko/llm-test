@@ -191,18 +191,11 @@ class OllamaClient:
         stream: bool = False,
         temperature: float | None = None,
         stream_print: bool = False,
-        timeout_sec: int = 3600,          # overall read timeout
-        first_token_timeout_sec: int = 180,  # fail if nothing arrives for 3 min
-        num_predict: int = 1024,          # cap generation (avoid endless outputs)
+        timeout_sec: int = 7200,              # allow long CPU runs
+        first_token_timeout_sec: int = 900,   # 15 min default for CPU prefill
+        num_predict: int = 1024,
         **_ignored,
     ):
-        """
-        Compatibility wrapper for Ollama /api/chat.
-
-        - stream=False: returns full string.
-        - stream=True & stream_print=True: prints tokens live and returns "" (avoids double print).
-        - stream=True & stream_print=False: returns full string (assembled).
-        """
         url = f"{self.base_url}/api/chat"
         payload = {
             "model": model,
@@ -210,32 +203,29 @@ class OllamaClient:
             "stream": stream,
         }
 
-        options = {}
+        options = {"num_predict": int(num_predict)}
         if temperature is not None:
             options["temperature"] = temperature
+        payload["options"] = options
 
-        # Hard cap so the model doesn't run forever
-        options["num_predict"] = int(num_predict)
-
-        if options:
-            payload["options"] = options
-
-        # Better timeout control:
-        # requests timeout can be a tuple: (connect_timeout, read_timeout)
         connect_timeout = 10
         read_timeout = int(timeout_sec)
 
         # ---------------- non-streaming ----------------
-        if not stream:
-            resp = requests.post(url, json=payload, timeout=(connect_timeout, read_timeout))
+        def _non_stream() -> str:
+            p = dict(payload)
+            p["stream"] = False
+            resp = requests.post(url, json=p, timeout=(connect_timeout, read_timeout))
             resp.raise_for_status()
             return resp.json()["message"]["content"]
 
-        # ---------------- streaming ----------------
+        if not stream:
+            return _non_stream()
+
+        # ---------------- streaming with fallback ----------------
         out_parts: list[str] = []
         got_any_token = False
         start_time = time.time()
-        last_token_time = start_time
 
         try:
             with requests.post(url, json=payload, stream=True, timeout=(connect_timeout, read_timeout)) as resp:
@@ -244,17 +234,17 @@ class OllamaClient:
                 for line in resp.iter_lines():
                     now = time.time()
 
-                    # Watchdog: if we haven't received ANY token soon enough, abort
+                    # If streaming produces nothing for too long, fallback
                     if not got_any_token and (now - start_time) > first_token_timeout_sec:
-                        raise TimeoutError(
-                            f"No tokens received from Ollama within {first_token_timeout_sec}s"
+                        # stop streaming attempt; fallback to non-stream
+                        return _non_stream() if not stream_print else (
+                            print(_non_stream(), end="", flush=True) or ""
                         )
 
                     if not line:
                         continue
 
                     data = json.loads(line.decode("utf-8"))
-
                     if data.get("done") is True:
                         break
 
@@ -264,23 +254,18 @@ class OllamaClient:
                         continue
 
                     got_any_token = True
-                    last_token_time = now
-
                     if stream_print:
                         print(token, end="", flush=True)
                     else:
                         out_parts.append(token)
 
-        except requests.exceptions.ReadTimeout as e:
-            # This is your current error; make it actionable.
-            raise TimeoutError(
-                "Ollama request timed out while waiting for output. "
-                "Likely causes: huge prompt/context, model overloaded, or num_predict too high. "
-                "Try lowering top_k/top_p, reducing retrieved context size, or lowering num_predict."
-            ) from e
+        except requests.exceptions.ReadTimeout:
+            # also fallback on read timeout
+            if stream_print:
+                print(_non_stream(), end="", flush=True)
+                return ""
+            return _non_stream()
 
-        # Avoid double print:
         if stream_print:
             return ""
-
         return "".join(out_parts)
