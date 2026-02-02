@@ -48,13 +48,27 @@ def iter_files(root: str, glob_pattern: str) -> Iterator[str]:
     Supports:
       - ** recursion
       - brace sets: *.{a,b,c}
+
+    Always skips:
+      - .git/
+      - common junk dirs
     """
     patterns = _expand_brace_glob(glob_pattern)
 
-    for base, _, files in os.walk(root):
+    SKIP_DIRS = {".git", ".svn", ".hg", ".idea", ".vscode", "__pycache__", ".venv", "vendor", "node_modules"}
+
+    for base, dirs, files in os.walk(root):
+        # prune unwanted dirs in-place (important for performance)
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+
         for fn in files:
+            # skip hidden files too
+            if fn.startswith("."):
+                continue
+
             full = os.path.join(base, fn)
             rel = os.path.relpath(full, root).replace(os.sep, "/")
+
             for pat in patterns:
                 pat_posix = pat.replace(os.sep, "/")
                 if fnmatch.fnmatch(rel, pat_posix):
