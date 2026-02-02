@@ -94,12 +94,27 @@ def list_files_multi_glob(root: str, glob_patterns: List[str]) -> List[str]:
             seen.add(path)
     return sorted(seen)
 
-def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
-    """Chunk text by characters with overlap."""
+def chunk_text(
+    text: str,
+    chunk_size: int,
+    chunk_overlap: int = 0,
+    *,
+    overlap: Optional[int] = None,
+) -> List[str]:
+    """
+    Chunk text by characters with overlap.
+
+    Backward compatible:
+      - ingest.py may call chunk_text(..., overlap=200)
+      - newer code may call chunk_text(..., chunk_overlap=200)
+    """
+    if overlap is not None:
+        chunk_overlap = overlap
+
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
     if chunk_overlap < 0 or chunk_overlap >= chunk_size:
-        raise ValueError("chunk_overlap must be >=0 and < chunk_size")
+        raise ValueError("overlap must be >=0 and < chunk_size")
 
     chunks: List[str] = []
     step = chunk_size - chunk_overlap
@@ -112,6 +127,7 @@ def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
         i += step
 
     return chunks
+
 
 
 # ============================================================
