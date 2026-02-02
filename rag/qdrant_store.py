@@ -37,10 +37,49 @@ class QdrantStore:
         )
 
     # ---------- ingest helpers ----------
-    def make_point(self, point_id: str, vector: List[float], payload: Dict[str, Any]) -> qm.PointStruct:
+    def make_point(self, *args, **kwargs) -> qm.PointStruct:
         """
-        ingest.py expects this method.
+        Backward compatible builder.
+
+        Supports BOTH:
+          A) make_point(point_id, vector, payload)
+          B) make_point(id=..., vector=..., source=..., path=..., content=..., chunk_id=..., meta=...)
+
+        ingest.py in your repo uses keyword args like: source=..., path=..., content=..., chunk_id=...
         """
+        # --- style A: positional (point_id, vector, payload)
+        if len(args) == 3 and not kwargs:
+            point_id, vector, payload = args
+            return qm.PointStruct(id=point_id, vector=vector, payload=payload)
+
+        # --- style B: keyword args (id/vector + fields)
+        point_id = kwargs.pop("id", None) or kwargs.pop("point_id", None)
+        vector = kwargs.pop("vector", None) or kwargs.pop("embedding", None)
+        if point_id is None or vector is None:
+            raise TypeError("make_point requires id/point_id and vector/embedding")
+
+        # Anything else becomes payload
+        payload = {}
+
+        # allow ingest.py passing payload explicitly too
+        if "payload" in kwargs:
+            p = kwargs.pop("payload") or {}
+            if isinstance(p, dict):
+                payload.update(p)
+
+        # common fields
+        for k in ["source", "path", "relpath", "chunk_id", "chunk_index", "content", "lang", "mtime", "sha256", "url"]:
+            if k in kwargs:
+                payload[k] = kwargs.pop(k)
+
+        # include nested meta dict if present
+        meta = kwargs.pop("meta", None)
+        if isinstance(meta, dict):
+            payload.update(meta)
+
+        # include any remaining kwargs (future-proof)
+        payload.update(kwargs)
+
         return qm.PointStruct(id=point_id, vector=vector, payload=payload)
 
     def upsert_points(self, points: List[qm.PointStruct]) -> None:
