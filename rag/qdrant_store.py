@@ -84,6 +84,9 @@ class QdrantStore:
 
     def upsert_points(self, points: List[qm.PointStruct]) -> None:
         self.client.upsert(collection_name=self.collection, points=points)
+    
+    def upsert(self, points: List[qm.PointStruct]) -> None:
+        self.upsert_points(points)
 
     def count(self, must: Optional[List[Dict[str, Any]]] = None) -> int:
         flt = _make_filter(must)
