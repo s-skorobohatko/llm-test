@@ -23,6 +23,11 @@ sources:
     path: "/opt/llm/llm-test/iptables"
     glob: "**/*"
 
+  - type: dir
+    name: "internal:module:keepalived"
+    path: "/opt/llm/llm-test/keepalived"
+    glob: "**/*"
+
   - type: git
     name: "vendor:puppetlabs:best-practices"
     url: "https://github.com/puppetlabs/best-practices.git"
@@ -58,8 +63,8 @@ sources:
     download_delay_sec: 3.0
 
     # Hard caps per run
-    max_modules_seen: 100
-    max_modules_synced: 40
+    max_modules_seen: 500
+    max_modules_synced: 
 
     # Filters
     only_owner: "puppetlabs"
