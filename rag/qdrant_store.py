@@ -44,47 +44,46 @@ class QdrantStore:
         Supports BOTH:
           A) make_point(point_id, vector, payload)
           B) make_point(id=..., vector=..., source=..., path=..., content=..., chunk_id=..., meta=...)
-
-        ingest.py in your repo uses keyword args like: source=..., path=..., content=..., chunk_id=...
         """
-        # --- style A: positional (point_id, vector, payload)
+        # style A: positional
         if len(args) == 3 and not kwargs:
             point_id, vector, payload = args
             return qm.PointStruct(id=point_id, vector=vector, payload=payload)
 
-        # --- style B: keyword args (id/vector + fields)
+        # style B: keyword args
         point_id = kwargs.pop("id", None) or kwargs.pop("point_id", None)
         vector = kwargs.pop("vector", None) or kwargs.pop("embedding", None)
         if point_id is None or vector is None:
             raise TypeError("make_point requires id/point_id and vector/embedding")
 
-        # Anything else becomes payload
-        payload = {}
+        payload: Dict[str, Any] = {}
 
-        # allow ingest.py passing payload explicitly too
-        if "payload" in kwargs:
-            p = kwargs.pop("payload") or {}
-            if isinstance(p, dict):
-                payload.update(p)
+        # allow explicit payload
+        p = kwargs.pop("payload", None)
+        if isinstance(p, dict):
+            payload.update(p)
 
         # common fields
-        for k in ["source", "path", "relpath", "chunk_id", "chunk_index", "content", "lang", "mtime", "sha256", "url"]:
+        for k in [
+            "source", "path", "relpath", "chunk_id", "chunk_index", "content",
+            "lang", "mtime", "sha256", "url", "file_sha256",
+        ]:
             if k in kwargs:
                 payload[k] = kwargs.pop(k)
 
-        # include nested meta dict if present
         meta = kwargs.pop("meta", None)
         if isinstance(meta, dict):
             payload.update(meta)
 
-        # include any remaining kwargs (future-proof)
+        # any remaining kwargs
         payload.update(kwargs)
 
         return qm.PointStruct(id=point_id, vector=vector, payload=payload)
 
     def upsert_points(self, points: List[qm.PointStruct]) -> None:
         self.client.upsert(collection_name=self.collection, points=points)
-    
+
+    # alias (some code uses store.upsert)
     def upsert(self, points: List[qm.PointStruct]) -> None:
         self.upsert_points(points)
 
@@ -101,13 +100,9 @@ class QdrantStore:
         min_sim: float,
         must: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Tuple[float, Dict[str, Any]]]:
-        """
-        Return list of (score, payload).
-        Compatible with multiple qdrant-client API variants.
-        """
+        """Return list of (score, payload)."""
         flt = _make_filter(must)
 
-        # Variant A: client.search(...)
         if hasattr(self.client, "search"):
             hits = self.client.search(
                 collection_name=self.collection,
@@ -119,7 +114,6 @@ class QdrantStore:
             )
             return [(float(h.score), dict(h.payload or {})) for h in hits]
 
-        # Variant B: client.query_points(...)
         if hasattr(self.client, "query_points"):
             try:
                 res = self.client.query_points(
@@ -151,31 +145,7 @@ class QdrantStore:
                 out.append((float(score), dict(payload or {})))
             return out
 
-        # Variant C: client.search_points(...)
-        if hasattr(self.client, "search_points"):
-            try:
-                res = self.client.search_points(
-                    collection_name=self.collection,
-                    vector=query_vector,
-                    limit=top_k,
-                    with_payload=True,
-                    score_threshold=min_sim,
-                    query_filter=flt,
-                )
-            except TypeError:
-                res = self.client.search_points(
-                    collection_name=self.collection,
-                    query_vector=query_vector,
-                    limit=top_k,
-                    with_payload=True,
-                    score_threshold=min_sim,
-                    query_filter=flt,
-                )
-
-            points = getattr(res, "points", res)
-            return [(float(p.score), dict(p.payload or {})) for p in points]
-
-        # Variant D: HTTP fallback
+        # last resort: HTTP
         req = qm.SearchRequest(
             vector=query_vector,
             limit=top_k,
@@ -183,8 +153,5 @@ class QdrantStore:
             score_threshold=min_sim,
             filter=flt,
         )
-        hits = self.client.http.search(
-            collection_name=self.collection,
-            search_request=req,
-        )
+        hits = self.client.http.search(collection_name=self.collection, search_request=req)
         return [(float(h.score), dict(h.payload or {})) for h in hits]
