@@ -193,7 +193,7 @@ class OllamaClient:
         stream_print: bool = False,
         timeout_sec: int = 7200,              # allow long CPU runs
         first_token_timeout_sec: int = 900,   # 15 min default for CPU prefill
-        num_predict: int = 1024,
+        num_predict: int = 4096,
         **_ignored,
     ):
         url = f"{self.base_url}/api/chat"
