@@ -24,37 +24,61 @@ def sha256_str(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()
 
 
-# Backward-compatible alias
+# Backward-compatible alias (some code uses sha256_text)
 sha256_text = sha256_str
 
 
-def iter_files(root: str, glob_pattern: str) -> Iterator[str]:
+def _expand_brace_glob(glob_pattern: str) -> List[str]:
     """
-    Yield file paths under root matching glob patterns like:
-      **/*.md
-      **/*.{pp,epp,md,yaml,yml,json}
+    Expand brace sets like **/*.{pp,epp,md} into multiple patterns.
+    If no braces, returns [glob_pattern].
     """
-    patterns: List[str] = []
-
-    # Expand brace sets: *.{a,b,c}
     if "{" in glob_pattern and "}" in glob_pattern:
         pre = glob_pattern.split("{", 1)[0]
         rest = glob_pattern.split("{", 1)[1]
         inner, post = rest.split("}", 1)
-        for alt in inner.split(","):
-            patterns.append(pre + alt.strip() + post)
-    else:
-        patterns.append(glob_pattern)
+        alts = [x.strip() for x in inner.split(",")]
+        return [pre + a + post for a in alts]
+    return [glob_pattern]
+
+
+def iter_files(root: str, glob_pattern: str) -> Iterator[str]:
+    """
+    Yield full file paths under root matching a glob.
+    Supports:
+      - ** recursion
+      - brace sets: *.{a,b,c}
+    """
+    patterns = _expand_brace_glob(glob_pattern)
 
     for base, _, files in os.walk(root):
         for fn in files:
             full = os.path.join(base, fn)
             rel = os.path.relpath(full, root).replace(os.sep, "/")
             for pat in patterns:
-                if fnmatch.fnmatch(rel, pat):
+                pat_posix = pat.replace(os.sep, "/")
+                if fnmatch.fnmatch(rel, pat_posix):
                     yield full
                     break
 
+
+def list_files_from_dir(root: str, glob_pattern: str) -> List[str]:
+    """
+    ingest.py expects this name.
+    Returns sorted list of matching full paths.
+    """
+    return sorted(iter_files(root, glob_pattern))
+
+def list_files_multi_glob(root: str, glob_patterns: List[str]) -> List[str]:
+    """
+    Return sorted, deduplicated list of files matching ANY of the glob patterns.
+    Used by ingest.py.
+    """
+    seen = set()
+    for pat in glob_patterns:
+        for path in iter_files(root, pat):
+            seen.add(path)
+    return sorted(seen)
 
 def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
     """Chunk text by characters with overlap."""
@@ -84,7 +108,7 @@ def git_sync(repo_url: str, dest: str, depth: int = 1) -> None:
     """
     Clone or fast-forward pull a git repository.
 
-    - If dest does not exist -> git clone
+    - If dest does not exist -> git clone --depth <depth>
     - If dest exists -> git pull --ff-only
     """
     if not os.path.exists(dest):
