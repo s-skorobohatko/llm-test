@@ -8,6 +8,7 @@ from raglib import (
     load_text_file,
     chunk_text,
     sha256_str,
+    uuid5_str,
     git_sync,
     list_files_from_dir,
     list_files_multi_glob,
@@ -49,6 +50,7 @@ def load_config(path: str) -> dict:
 
 def collect_files_from_source(src: dict) -> list[str]:
     stype = src["type"]
+
     if stype == "git":
         git_sync(src["url"], src["dest"], depth=int(src.get("depth", 1)))
         return list_files_from_dir(src["dest"], src["glob"])
@@ -59,13 +61,11 @@ def collect_files_from_source(src: dict) -> list[str]:
         return list_files_from_dir(root, globp)
 
     if stype == "forge_discover":
-        # Your forge discover/sync is already implemented elsewhere in your repo.
-        # Here we just keep compatibility: indexing happens from whatever exists in dest.
+        # indexes whatever already exists in dest
         dest = src["dest"]
         include_globs = src.get("include_globs") or []
         if include_globs:
             return list_files_multi_glob(dest, include_globs)
-        # fallback
         return list_files_from_dir(dest, "**/*")
 
     raise ValueError(f"Unknown source type: {stype}")
@@ -90,7 +90,7 @@ def main():
         raise SystemExit("No sources in config")
 
     # Collect files in CONFIG ORDER
-    file_jobs = []  # (source_name, root_hint, file_path)
+    file_jobs = []  # (source_name, src, file_path)
     for src in sources:
         name = src["name"]
         try:
@@ -125,26 +125,22 @@ def main():
         try:
             log(f"[ingest] {i}/{len(file_jobs)} {path}")
 
-            # skip non-text or too big
             if not safe_is_text_file(path):
                 continue
 
             text = load_text_file(path)
-
             chunks = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
-            # embed + upsert each chunk
+
             for chunk_index, chunk in enumerate(chunks):
-                # embed
                 vec = ollama.embed(cfg["embed_model"], chunk)
 
-                # ensure collection once we know dim
                 if not collection_ready:
                     store.ensure_collection(dim=len(vec))
                     collection_ready = True
 
-                # stable id per chunk
                 chunk_hash = sha256_str(chunk)
-                point_id = sha256_str(f"{source_name}|{path}|{chunk_index}|{chunk_hash}")
+                # Qdrant requires ID to be int or UUID -> use deterministic UUIDv5
+                point_id = uuid5_str(f"{source_name}|{path}|{chunk_index}|{chunk_hash}")
 
                 payload = {
                     "source": source_name,
@@ -166,7 +162,6 @@ def main():
             errors += 1
             log(f"[ERROR] source={source_name} path={path} err={e}")
 
-    # flush
     if batch_points:
         store.upsert_points(batch_points)
         upserted += len(batch_points)
@@ -188,4 +183,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-і

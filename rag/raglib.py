@@ -3,6 +3,7 @@ import json
 import os
 import fnmatch
 import subprocess
+import uuid
 from typing import Iterator, List, Optional
 
 import requests
@@ -26,6 +27,14 @@ def sha256_str(s: str) -> str:
 
 # Backward-compatible alias
 sha256_text = sha256_str
+
+
+def uuid5_str(s: str, namespace: uuid.UUID = uuid.NAMESPACE_URL) -> str:
+    """
+    Deterministic UUID (v5) for a given string.
+    Qdrant accepts UUID strings as point IDs.
+    """
+    return str(uuid.uuid5(namespace, s))
 
 
 def _expand_brace_glob(glob_pattern: str) -> List[str]:
