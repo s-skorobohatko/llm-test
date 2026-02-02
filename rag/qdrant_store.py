@@ -5,12 +5,6 @@ from qdrant_client.http import models as qm
 
 
 def _field_condition(cond: Dict[str, Any]) -> qm.FieldCondition:
-    """
-    Convert a simple dict to Qdrant FieldCondition.
-    Supports:
-      {"key":"source","match":{"value":"vendor:puppetlabs:best-practices"}}  (exact)
-      {"key":"path","match":{"text":"/opt/llm/llm-test/iptables"}}           (substring)
-    """
     key = cond["key"]
     m = cond["match"]
     if "value" in m:
@@ -31,6 +25,7 @@ class QdrantStore:
         self.client = QdrantClient(url=url)
         self.collection = collection
 
+    # ---------- collection ----------
     def ensure_collection(self, dim: int) -> None:
         cols = self.client.get_collections().collections
         if any(c.name == self.collection for c in cols):
@@ -41,6 +36,13 @@ class QdrantStore:
             vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
         )
 
+    # ---------- ingest helpers ----------
+    def make_point(self, point_id: str, vector: List[float], payload: Dict[str, Any]) -> qm.PointStruct:
+        """
+        ingest.py expects this method.
+        """
+        return qm.PointStruct(id=point_id, vector=vector, payload=payload)
+
     def upsert_points(self, points: List[qm.PointStruct]) -> None:
         self.client.upsert(collection_name=self.collection, points=points)
 
@@ -49,6 +51,7 @@ class QdrantStore:
         res = self.client.count(collection_name=self.collection, count_filter=flt, exact=True)
         return int(res.count)
 
+    # ---------- search ----------
     def search(
         self,
         query_vector: List[float],
@@ -62,7 +65,7 @@ class QdrantStore:
         """
         flt = _make_filter(must)
 
-        # Variant A: classic client.search(...)
+        # Variant A: client.search(...)
         if hasattr(self.client, "search"):
             hits = self.client.search(
                 collection_name=self.collection,
@@ -74,30 +77,27 @@ class QdrantStore:
             )
             return [(float(h.score), dict(h.payload or {})) for h in hits]
 
-        # Variant B: newer client.query_points(...)
-        # Some versions use "query" or "vector" naming; we handle both by trying.
+        # Variant B: client.query_points(...)
         if hasattr(self.client, "query_points"):
             try:
                 res = self.client.query_points(
                     collection_name=self.collection,
-                    query=query_vector,            # some versions
+                    query=query_vector,
                     limit=top_k,
                     with_payload=True,
                     score_threshold=min_sim,
                     query_filter=flt,
                 )
             except TypeError:
-                # alternate signature
                 res = self.client.query_points(
                     collection_name=self.collection,
-                    vector=query_vector,           # some versions
+                    vector=query_vector,
                     limit=top_k,
                     with_payload=True,
                     score_threshold=min_sim,
                     query_filter=flt,
                 )
 
-            # res can be object with .points or list-like depending on version
             points = getattr(res, "points", res)
             out = []
             for p in points:
@@ -131,14 +131,9 @@ class QdrantStore:
                 )
 
             points = getattr(res, "points", res)
-            out = []
-            for p in points:
-                score = getattr(p, "score", None)
-                payload = getattr(p, "payload", None)
-                out.append((float(score), dict(payload or {})))
-            return out
+            return [(float(p.score), dict(p.payload or {})) for p in points]
 
-        # Variant D: very old low-level HTTP API
+        # Variant D: HTTP fallback
         req = qm.SearchRequest(
             vector=query_vector,
             limit=top_k,
