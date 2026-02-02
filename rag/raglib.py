@@ -189,14 +189,19 @@ class OllamaClient:
         *,
         stream: bool = False,
         temperature: float | None = None,
+        stream_print: bool = False,   # <-- accept ask.py kwarg
     ):
         """
         messages = [
           {"role": "system", "content": "..."},
           {"role": "user", "content": "..."}
         ]
-        """
 
+        If stream=True and stream_print=True -> print tokens as they arrive.
+        Returns:
+          - if stream=False: full string
+          - if stream=True: full string (assembled), while optionally printing tokens
+        """
         url = f"{self.base_url}/api/chat"
         payload = {
             "model": model,
@@ -207,18 +212,30 @@ class OllamaClient:
         if temperature is not None:
             payload["options"] = {"temperature": temperature}
 
+        # non-streaming
         if not stream:
             resp = requests.post(url, json=payload, timeout=600)
             resp.raise_for_status()
             return resp.json()["message"]["content"]
 
-        # streaming mode
+        # streaming: print as we go (optional) + also return full content at end
+        out_parts: list[str] = []
         with requests.post(url, json=payload, stream=True, timeout=600) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
                 if not line:
                     continue
                 data = json.loads(line.decode("utf-8"))
-                if "message" in data and "content" in data["message"]:
-                    yield data["message"]["content"]
 
+                # done flag sometimes present
+                if data.get("done") is True:
+                    break
+
+                msg = data.get("message") or {}
+                token = msg.get("content", "")
+                if token:
+                    out_parts.append(token)
+                    if stream_print:
+                        print(token, end="", flush=True)
+
+        return "".join(out_parts)
