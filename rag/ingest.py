@@ -1,7 +1,9 @@
+#!/usr/bin/env python3
 import argparse
 import os
 import time
 import yaml
+from typing import Optional
 
 from raglib import (
     OllamaClient,
@@ -17,11 +19,11 @@ from raglib import (
 from qdrant_store import QdrantStore
 
 
-def ts():
+def ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def log(msg: str):
+def log(msg: str) -> None:
     print(f"{ts()} {msg}", flush=True)
 
 
@@ -35,7 +37,6 @@ def safe_is_text_file(path: str, max_bytes: int = 2_000_000) -> bool:
             return False
         with open(path, "rb") as f:
             head = f.read(4096)
-        # binary-ish if many nulls
         if b"\x00" in head:
             return False
         return True
@@ -45,7 +46,13 @@ def safe_is_text_file(path: str, max_bytes: int = 2_000_000) -> bool:
 
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
+
+
+def require_keys(cfg: dict, keys: list[str], where: str) -> None:
+    missing = [k for k in keys if k not in cfg or cfg[k] in (None, "")]
+    if missing:
+        raise SystemExit(f"Missing config keys in {where}: {', '.join(missing)}")
 
 
 def collect_files_from_source(src: dict) -> list[str]:
@@ -71,13 +78,51 @@ def collect_files_from_source(src: dict) -> list[str]:
     raise ValueError(f"Unknown source type: {stype}")
 
 
-def main():
+def source_module_root(src: dict) -> str:
+    """
+    Determine a stable module_root for payload scoping.
+
+    This should match what you'll pass to ask.py --scope.
+    """
+    stype = src.get("type")
+
+    if stype == "dir":
+        return (src.get("path") or "").rstrip("/")
+
+    if stype == "git":
+        return (src.get("dest") or "").rstrip("/")
+
+    if stype == "forge_discover":
+        # This is the dest root; scoping by module_root for forge is less useful,
+        # but still consistent if you want it.
+        return (src.get("dest") or "").rstrip("/")
+
+    return ""
+
+
+def compute_relpath(module_root: str, path: str) -> str:
+    """
+    Compute relpath if path is under module_root. Otherwise return empty.
+    Normalize to forward slashes for stable printing/prompts.
+    """
+    try:
+        mr = os.path.abspath(module_root)
+        p = os.path.abspath(path)
+        if mr and os.path.commonpath([mr, p]) == mr:
+            return os.path.relpath(p, mr).replace(os.sep, "/")
+    except Exception:
+        pass
+    return ""
+
+
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="./config.yaml")
-    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--batch", type=int, default=64, help="Upsert batch size (points)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    require_keys(cfg, ["ollama_url", "embed_model", "qdrant_url", "qdrant_collection", "sources"], args.config)
 
     ollama = OllamaClient(cfg["ollama_url"])
     store = QdrantStore(cfg["qdrant_url"], cfg["qdrant_collection"])
@@ -90,13 +135,14 @@ def main():
         raise SystemExit("No sources in config")
 
     # Collect files in CONFIG ORDER
-    file_jobs = []  # (source_name, src, file_path)
+    file_jobs: list[tuple[str, dict, str, str]] = []  # (source_name, src, module_root, file_path)
     for src in sources:
         name = src["name"]
         try:
+            module_root = source_module_root(src)
             files = collect_files_from_source(src)
             for fp in files:
-                file_jobs.append((name, src, fp))
+                file_jobs.append((name, src, module_root, fp))
         except Exception as e:
             log(f"[ERROR] source={name} err={e}")
 
@@ -113,7 +159,6 @@ def main():
         except Exception as e:
             log(f"[qdrant] before source={name} err={e}")
 
-    # ingest loop
     errors = 0
     upserted = 0
     t0 = time.time()
@@ -121,7 +166,7 @@ def main():
     batch_points = []
     collection_ready = False
 
-    for i, (source_name, src, path) in enumerate(file_jobs, start=1):
+    for i, (source_name, src, module_root, path) in enumerate(file_jobs, start=1):
         try:
             log(f"[ingest] {i}/{len(file_jobs)} {path}")
 
@@ -131,6 +176,8 @@ def main():
             text = load_text_file(path)
             chunks = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
 
+            relpath = compute_relpath(module_root, path)
+
             for chunk_index, chunk in enumerate(chunks):
                 vec = ollama.embed(cfg["embed_model"], chunk)
 
@@ -139,12 +186,13 @@ def main():
                     collection_ready = True
 
                 chunk_hash = sha256_str(chunk)
-                # Qdrant requires ID to be int or UUID -> use deterministic UUIDv5
                 point_id = uuid5_str(f"{source_name}|{path}|{chunk_index}|{chunk_hash}")
 
                 payload = {
                     "source": source_name,
+                    "module_root": module_root,
                     "path": path,
+                    "relpath": relpath,
                     "chunk_id": f"{os.path.basename(path)}#chunk{chunk_index}",
                     "chunk_index": chunk_index,
                     "content": chunk,

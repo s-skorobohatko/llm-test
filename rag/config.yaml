@@ -14,6 +14,11 @@ ingest_batch_size: 128
 chunk_size: 1200
 chunk_overlap: 200
 
+prompt_dir: "./prompts"
+
+default_ref_sources:
+  - "vendor:puppetlabs:best-practices"
+
 top_k: 6
 min_sim: 0.18
 

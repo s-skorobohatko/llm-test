@@ -1,0 +1,13 @@
+You must refactor ONLY the module under: {scope}
+
+RAG-FIRST RULES:
+- Use MODULE_CONTEXT to know what files/classes/params actually exist.
+- Use REFERENCE_CONTEXT to decide HOW to refactor (Puppet best practices, patterns, examples).
+- Do NOT invent file paths. Only change existing MODULE files, unless you explicitly justify creating a new file.
+- Avoid copying large context verbatim. Quote only small snippets if needed.
+- For each non-trivial refactor decision, cite at least one reference chunk like: (REF [n]).
+- When changing code, be idempotent and Puppet-idiomatic.
+
+{ref_ctx}
+
+{module_ctx}

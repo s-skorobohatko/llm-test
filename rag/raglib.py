@@ -191,27 +191,31 @@ class OllamaClient:
         stream: bool = False,
         temperature: float | None = None,
         stream_print: bool = False,
-        timeout_sec: int = 7200,              # allow long CPU runs
-        first_token_timeout_sec: int = 900,   # 15 min default for CPU prefill
-        num_predict: int = 4096,
+        timeout_sec: int = 7200,
+        first_token_timeout_sec: int = 900,
         **_ignored,
-    ):
+    ) -> str:
+        """
+        - No num_predict is sent => no hard-stop enforced by client.
+        - Streaming always returns the full answer text (even when printing live).
+        """
         url = f"{self.base_url}/api/chat"
-        payload = {
+        payload: dict = {
             "model": model,
             "messages": messages,
-            "stream": stream,
+            "stream": bool(stream),
         }
 
-        options = {"num_predict": int(num_predict)}
+        # Only include options you truly want to force.
+        options: dict = {}
         if temperature is not None:
-            options["temperature"] = temperature
-        payload["options"] = options
+            options["temperature"] = float(temperature)
+        if options:
+            payload["options"] = options
 
         connect_timeout = 10
         read_timeout = int(timeout_sec)
 
-        # ---------------- non-streaming ----------------
         def _non_stream() -> str:
             p = dict(payload)
             p["stream"] = False
@@ -222,7 +226,6 @@ class OllamaClient:
         if not stream:
             return _non_stream()
 
-        # ---------------- streaming with fallback ----------------
         out_parts: list[str] = []
         got_any_token = False
         start_time = time.time()
@@ -234,12 +237,12 @@ class OllamaClient:
                 for line in resp.iter_lines():
                     now = time.time()
 
-                    # If streaming produces nothing for too long, fallback
+                    # If the model takes too long to emit the first token, fallback to non-stream.
                     if not got_any_token and (now - start_time) > first_token_timeout_sec:
-                        # stop streaming attempt; fallback to non-stream
-                        return _non_stream() if not stream_print else (
-                            print(_non_stream(), end="", flush=True) or ""
-                        )
+                        fallback = _non_stream()
+                        if stream_print:
+                            print(fallback, end="", flush=True)
+                        return fallback
 
                     if not line:
                         continue
@@ -254,18 +257,15 @@ class OllamaClient:
                         continue
 
                     got_any_token = True
+                    out_parts.append(token)
+
                     if stream_print:
                         print(token, end="", flush=True)
-                    else:
-                        out_parts.append(token)
 
         except requests.exceptions.ReadTimeout:
-            # also fallback on read timeout
+            fallback = _non_stream()
             if stream_print:
-                print(_non_stream(), end="", flush=True)
-                return ""
-            return _non_stream()
+                print(fallback, end="", flush=True)
+            return fallback
 
-        if stream_print:
-            return ""
         return "".join(out_parts)

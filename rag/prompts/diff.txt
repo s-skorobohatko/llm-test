@@ -1,0 +1,33 @@
+{common_rules}
+
+TASK:
+{question}
+
+OUTPUT:
+For each changed file, output a diff using the following EXACT format.
+
+DIFF FILE: <path>
+--------------------------------
+OLD:
+<only the relevant original lines>
+
+NEW:
+<the modified lines>
+
+--------------------------------
+END DIFF
+
+RULES:
+- Use real paths that exist in MODULE_CONTEXT.
+- One DIFF FILE block per file.
+- Do NOT include unchanged files.
+- If you create a new file, use:
+
+DIFF FILE: <path> (NEW FILE)
+--------------------------------
+NEW:
+<full file content>
+--------------------------------
+END DIFF
+
+- Keep changes minimal unless REFERENCE_CONTEXT strongly supports a larger refactor.
