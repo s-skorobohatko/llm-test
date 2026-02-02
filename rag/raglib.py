@@ -2,96 +2,116 @@ import hashlib
 import json
 import os
 import fnmatch
+import subprocess
 from typing import Iterator, List, Optional
 
 import requests
 
 
-# ----------------------------
+# ============================================================
 # Text / file utilities (used by ingest.py)
-# ----------------------------
+# ============================================================
 
 def load_text_file(path: str) -> str:
-    """
-    Read a text file as UTF-8 (with replacement), return full contents as string.
-    """
+    """Read a text file as UTF-8 (with replacement)."""
     with open(path, "rb") as f:
         raw = f.read()
     return raw.decode("utf-8", errors="replace")
 
 
 def sha256_str(s: str) -> str:
-    """
-    Stable hash for string content (used as point id / content hash).
-    """
+    """Stable hash for string content."""
     return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()
 
 
-# Backward-compatible alias if other code uses a different name
+# Backward-compatible alias
 sha256_text = sha256_str
 
 
 def iter_files(root: str, glob_pattern: str) -> Iterator[str]:
     """
-    Yield file paths under root matching a glob like:
+    Yield file paths under root matching glob patterns like:
       **/*.md
       **/*.{pp,epp,md,yaml,yml,json}
-
-    Supports:
-      - ** recursion
-      - brace sets: *.{a,b,c}
     """
+    patterns: List[str] = []
+
     # Expand brace sets: *.{a,b,c}
-    patterns = []
     if "{" in glob_pattern and "}" in glob_pattern:
         pre = glob_pattern.split("{", 1)[0]
         rest = glob_pattern.split("{", 1)[1]
         inner, post = rest.split("}", 1)
-        alts = [x.strip() for x in inner.split(",")]
-        for a in alts:
-            patterns.append(pre + a + post)
+        for alt in inner.split(","):
+            patterns.append(pre + alt.strip() + post)
     else:
         patterns.append(glob_pattern)
 
     for base, _, files in os.walk(root):
         for fn in files:
             full = os.path.join(base, fn)
-            rel = os.path.relpath(full, root)
-            rel_posix = rel.replace(os.sep, "/")
-
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
             for pat in patterns:
-                pat_posix = pat.replace(os.sep, "/")
-                if fnmatch.fnmatch(rel_posix, pat_posix):
+                if fnmatch.fnmatch(rel, pat):
                     yield full
                     break
 
 
 def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
-    """
-    Chunk by characters with overlap (fast, simple).
-    """
+    """Chunk text by characters with overlap."""
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
     if chunk_overlap < 0 or chunk_overlap >= chunk_size:
-        raise ValueError("chunk_overlap must be >= 0 and < chunk_size")
+        raise ValueError("chunk_overlap must be >=0 and < chunk_size")
 
     chunks: List[str] = []
-    i = 0
-    n = len(text)
     step = chunk_size - chunk_overlap
+    i = 0
 
-    while i < n:
-        chunk = text[i:i + chunk_size]
-        if chunk.strip():
-            chunks.append(chunk)
+    while i < len(text):
+        part = text[i:i + chunk_size]
+        if part.strip():
+            chunks.append(part)
         i += step
 
     return chunks
 
 
-# ----------------------------
+# ============================================================
+# Git utilities (used by ingest.py)
+# ============================================================
+
+def git_sync(repo_url: str, dest: str, depth: int = 1) -> None:
+    """
+    Clone or fast-forward pull a git repository.
+
+    - If dest does not exist -> git clone
+    - If dest exists -> git pull --ff-only
+    """
+    if not os.path.exists(dest):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        cmd = ["git", "clone", "--depth", str(depth), repo_url, dest]
+    else:
+        cmd = ["git", "-C", dest, "pull", "--ff-only"]
+
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git_sync failed for {repo_url}\n"
+            f"CMD: {' '.join(cmd)}\n"
+            f"STDOUT:\n{proc.stdout}\n"
+            f"STDERR:\n{proc.stderr}"
+        )
+
+
+# ============================================================
 # Ollama client (used by ask.py + ingest.py)
-# ----------------------------
+# ============================================================
 
 class OllamaClient:
     def __init__(self, base_url: str):
@@ -102,8 +122,7 @@ class OllamaClient:
         payload = {"model": model, "prompt": text}
         resp = requests.post(url, json=payload, timeout=600)
         resp.raise_for_status()
-        data = resp.json()
-        return data["embedding"]
+        return resp.json()["embedding"]
 
     def chat(
         self,
@@ -117,15 +136,14 @@ class OllamaClient:
         timeout_sec: int = 3600,
     ) -> str:
         """
-        Compatible chat:
-        - If messages is provided, uses /api/chat with messages
-        - Else uses /api/generate with prompt (+ optional system)
+        - messages -> /api/chat
+        - prompt   -> /api/generate
 
-        stream=True prints tokens live (if stream_print=True) and returns full text.
+        stream=True prints tokens live and returns full text.
         """
         options = options or {}
 
-        # --- /api/chat ---
+        # ---------------- /api/chat ----------------
         if messages is not None:
             url = f"{self.base_url}/api/chat"
             payload = {
@@ -136,40 +154,37 @@ class OllamaClient:
             }
 
             if not stream:
-                resp = requests.post(url, json=payload, timeout=timeout_sec)
-                resp.raise_for_status()
-                data = resp.json()
-                return data.get("message", {}).get("content", "")
+                r = requests.post(url, json=payload, timeout=timeout_sec)
+                r.raise_for_status()
+                return r.json().get("message", {}).get("content", "")
 
-            # streaming
-            resp = requests.post(url, json=payload, stream=True, timeout=(10, timeout_sec))
-            resp.raise_for_status()
+            r = requests.post(url, json=payload, stream=True, timeout=(10, timeout_sec))
+            r.raise_for_status()
 
-            out_chunks: List[str] = []
-            for raw in resp.iter_lines(chunk_size=1, delimiter=b"\n"):
+            out: List[str] = []
+            for raw in r.iter_lines(chunk_size=1, delimiter=b"\n"):
                 if not raw:
                     continue
                 try:
-                    line = raw.decode("utf-8", errors="replace")
-                    data = json.loads(line)
+                    data = json.loads(raw.decode("utf-8", errors="replace"))
                 except Exception:
                     continue
 
                 msg = data.get("message") or {}
                 piece = msg.get("content") or ""
                 if piece:
-                    out_chunks.append(piece)
+                    out.append(piece)
                     if stream_print:
                         print(piece, end="", flush=True)
 
-                if data.get("done") is True:
+                if data.get("done"):
                     break
 
-            return "".join(out_chunks)
+            return "".join(out)
 
-        # --- /api/generate ---
+        # ---------------- /api/generate ----------------
         if prompt is None:
-            raise TypeError("chat() requires either prompt=... or messages=[...]")
+            raise TypeError("chat() requires prompt or messages")
 
         url = f"{self.base_url}/api/generate"
         payload = {
@@ -182,31 +197,29 @@ class OllamaClient:
             payload["system"] = system
 
         if not stream:
-            resp = requests.post(url, json=payload, timeout=timeout_sec)
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("response", "")
+            r = requests.post(url, json=payload, timeout=timeout_sec)
+            r.raise_for_status()
+            return r.json().get("response", "")
 
-        resp = requests.post(url, json=payload, stream=True, timeout=(10, timeout_sec))
-        resp.raise_for_status()
+        r = requests.post(url, json=payload, stream=True, timeout=(10, timeout_sec))
+        r.raise_for_status()
 
-        out_chunks: List[str] = []
-        for raw in resp.iter_lines(chunk_size=1, delimiter=b"\n"):
+        out: List[str] = []
+        for raw in r.iter_lines(chunk_size=1, delimiter=b"\n"):
             if not raw:
                 continue
             try:
-                line = raw.decode("utf-8", errors="replace")
-                data = json.loads(line)
+                data = json.loads(raw.decode("utf-8", errors="replace"))
             except Exception:
                 continue
 
             piece = data.get("response") or ""
             if piece:
-                out_chunks.append(piece)
+                out.append(piece)
                 if stream_print:
                     print(piece, end="", flush=True)
 
-            if data.get("done") is True:
+            if data.get("done"):
                 break
 
-        return "".join(out_chunks)
+        return "".join(out)
