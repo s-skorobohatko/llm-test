@@ -2,8 +2,7 @@ import hashlib
 import json
 import os
 import fnmatch
-from dataclasses import dataclass
-from typing import Iterable, Iterator, List, Optional, Tuple
+from typing import Iterator, List, Optional
 
 import requests
 
@@ -21,16 +20,26 @@ def load_text_file(path: str) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def sha256_text(s: str) -> str:
+def sha256_str(s: str) -> str:
+    """
+    Stable hash for string content (used as point id / content hash).
+    """
     return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()
+
+
+# Backward-compatible alias if other code uses a different name
+sha256_text = sha256_str
 
 
 def iter_files(root: str, glob_pattern: str) -> Iterator[str]:
     """
-    Yield file paths under root matching a glob like **/*.md or **/*.{pp,epp,md}.
+    Yield file paths under root matching a glob like:
+      **/*.md
+      **/*.{pp,epp,md,yaml,yml,json}
+
     Supports:
       - ** recursion
-      - brace sets: *.{pp,epp,md}
+      - brace sets: *.{a,b,c}
     """
     # Expand brace sets: *.{a,b,c}
     patterns = []
@@ -44,14 +53,13 @@ def iter_files(root: str, glob_pattern: str) -> Iterator[str]:
     else:
         patterns.append(glob_pattern)
 
-    # Walk all files and match using fnmatch
     for base, _, files in os.walk(root):
         for fn in files:
             full = os.path.join(base, fn)
             rel = os.path.relpath(full, root)
             rel_posix = rel.replace(os.sep, "/")
+
             for pat in patterns:
-                # normalize patterns to posix
                 pat_posix = pat.replace(os.sep, "/")
                 if fnmatch.fnmatch(rel_posix, pat_posix):
                     yield full
@@ -60,14 +68,14 @@ def iter_files(root: str, glob_pattern: str) -> Iterator[str]:
 
 def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
     """
-    Chunk by characters (simple, fast) with overlap.
+    Chunk by characters with overlap (fast, simple).
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
     if chunk_overlap < 0 or chunk_overlap >= chunk_size:
-        raise ValueError("chunk_overlap must be >=0 and < chunk_size")
+        raise ValueError("chunk_overlap must be >= 0 and < chunk_size")
 
-    chunks = []
+    chunks: List[str] = []
     i = 0
     n = len(text)
     step = chunk_size - chunk_overlap
@@ -100,23 +108,24 @@ class OllamaClient:
     def chat(
         self,
         model: str,
-        prompt: str = None,
+        prompt: Optional[str] = None,
         messages=None,
-        system: str = None,
-        options: dict = None,
+        system: Optional[str] = None,
+        options: Optional[dict] = None,
         stream: bool = False,
         stream_print: bool = True,
         timeout_sec: int = 3600,
     ) -> str:
         """
-        If messages is provided -> /api/chat
-        else -> /api/generate
+        Compatible chat:
+        - If messages is provided, uses /api/chat with messages
+        - Else uses /api/generate with prompt (+ optional system)
 
         stream=True prints tokens live (if stream_print=True) and returns full text.
         """
         options = options or {}
 
-        # --- CHAT endpoint ---
+        # --- /api/chat ---
         if messages is not None:
             url = f"{self.base_url}/api/chat"
             payload = {
@@ -132,10 +141,11 @@ class OllamaClient:
                 data = resp.json()
                 return data.get("message", {}).get("content", "")
 
+            # streaming
             resp = requests.post(url, json=payload, stream=True, timeout=(10, timeout_sec))
             resp.raise_for_status()
 
-            out_chunks = []
+            out_chunks: List[str] = []
             for raw in resp.iter_lines(chunk_size=1, delimiter=b"\n"):
                 if not raw:
                     continue
@@ -157,7 +167,7 @@ class OllamaClient:
 
             return "".join(out_chunks)
 
-        # --- GENERATE endpoint ---
+        # --- /api/generate ---
         if prompt is None:
             raise TypeError("chat() requires either prompt=... or messages=[...]")
 
@@ -180,7 +190,7 @@ class OllamaClient:
         resp = requests.post(url, json=payload, stream=True, timeout=(10, timeout_sec))
         resp.raise_for_status()
 
-        out_chunks = []
+        out_chunks: List[str] = []
         for raw in resp.iter_lines(chunk_size=1, delimiter=b"\n"):
             if not raw:
                 continue
