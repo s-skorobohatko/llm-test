@@ -173,9 +173,52 @@ class OllamaClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
 
+    # ---------- embeddings ----------
     def embed(self, model: str, text: str) -> List[float]:
         url = f"{self.base_url}/api/embeddings"
         payload = {"model": model, "prompt": text}
         resp = requests.post(url, json=payload, timeout=600)
         resp.raise_for_status()
         return resp.json()["embedding"]
+
+    # ---------- chat ----------
+    def chat(
+        self,
+        model: str,
+        messages: list[dict],
+        *,
+        stream: bool = False,
+        temperature: float | None = None,
+    ):
+        """
+        messages = [
+          {"role": "system", "content": "..."},
+          {"role": "user", "content": "..."}
+        ]
+        """
+
+        url = f"{self.base_url}/api/chat"
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+        }
+
+        if temperature is not None:
+            payload["options"] = {"temperature": temperature}
+
+        if not stream:
+            resp = requests.post(url, json=payload, timeout=600)
+            resp.raise_for_status()
+            return resp.json()["message"]["content"]
+
+        # streaming mode
+        with requests.post(url, json=payload, stream=True, timeout=600) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                data = json.loads(line.decode("utf-8"))
+                if "message" in data and "content" in data["message"]:
+                    yield data["message"]["content"]
+
