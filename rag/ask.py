@@ -279,6 +279,7 @@ def main() -> None:
             messages=[{"role": "user", "content": plan_prompt}],
             stream=True,
             stream_print=(not args.json),
+            stop=["END OF ANSWER"],
         )
         if not args.json:
             print("\n")  # newline after streaming
@@ -297,6 +298,7 @@ def main() -> None:
                 messages=[{"role": "user", "content": diff_prompt2}],
                 stream=True,
                 stream_print=(not args.json),
+                stop=["END OF ANSWER"],
             )
         else:
             diff_text = client.chat(
@@ -304,6 +306,7 @@ def main() -> None:
                 messages=[{"role": "user", "content": diff_prompt}],
                 stream=True,
                 stream_print=(not args.json),
+                stop=["END OF ANSWER"],
             )
 
         if not args.json:

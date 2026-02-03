@@ -190,26 +190,25 @@ class OllamaClient:
         *,
         stream: bool = False,
         temperature: float | None = None,
+        stop: list[str] | None = None,
         stream_print: bool = False,
         timeout_sec: int = 7200,
         first_token_timeout_sec: int = 900,
         **_ignored,
-    ) -> str:
-        """
-        - No num_predict is sent => no hard-stop enforced by client.
-        - Streaming always returns the full answer text (even when printing live).
-        """
+    ):
         url = f"{self.base_url}/api/chat"
-        payload: dict = {
+        payload = {
             "model": model,
             "messages": messages,
-            "stream": bool(stream),
+            "stream": stream,
         }
 
-        # Only include options you truly want to force.
-        options: dict = {}
+        # IMPORTANT: no num_predict here
+        options = {}
         if temperature is not None:
-            options["temperature"] = float(temperature)
+            options["temperature"] = temperature
+        if stop:
+            options["stop"] = stop
         if options:
             payload["options"] = options
 
@@ -237,12 +236,12 @@ class OllamaClient:
                 for line in resp.iter_lines():
                     now = time.time()
 
-                    # If the model takes too long to emit the first token, fallback to non-stream.
                     if not got_any_token and (now - start_time) > first_token_timeout_sec:
-                        fallback = _non_stream()
+                        # fallback to non-stream if no tokens
+                        text = _non_stream()
                         if stream_print:
-                            print(fallback, end="", flush=True)
-                        return fallback
+                            print(text, end="", flush=True)
+                        return text
 
                     if not line:
                         continue
@@ -258,14 +257,14 @@ class OllamaClient:
 
                     got_any_token = True
                     out_parts.append(token)
-
                     if stream_print:
                         print(token, end="", flush=True)
 
         except requests.exceptions.ReadTimeout:
-            fallback = _non_stream()
+            text = _non_stream()
             if stream_print:
-                print(fallback, end="", flush=True)
-            return fallback
+                print(text, end="", flush=True)
+            return text
 
-        return "".join(out_parts)
+        final = "".join(out_parts)
+        return final
