@@ -33,10 +33,11 @@ sources:
     glob: "**/*.md"
 
   - name: "wikimedia_guidelines"
-    type: "git"
-    url: "https://github.com/wikimedia/puppet-guidelines.git"
-    dest: "./sources/vendor/wikimedia/puppet-guidelines"
+    name: "vendor:puppetlabs:best-practices"
+    url: "https://github.com/puppetlabs/best-practices.git"
+    dest: "./sources/vendor/puppetlabs/best-practices"
     glob: "**/*.md"
+
 
   # - name: "internal_gold_standards"
   #   type: "dir"
