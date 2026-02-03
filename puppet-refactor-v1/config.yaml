@@ -1,7 +1,7 @@
 ollama_url: "http://127.0.0.1:11434"
 
 models:
-  embed: "nomic-embed-text"
+  embed: "nomic-embed-text:latest"
   chat: "qwen2.5-coder:7b-instruct-q4_K_M"
 
 vector_store:
