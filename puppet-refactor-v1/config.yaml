@@ -18,7 +18,7 @@ limits:
   retrieve_max_chars: 18000
   max_files_read: 200
   max_file_bytes: 2000000
-  max_files_blob_chars: 140000
+  max_files_blob_chars: 30000
   max_embed_chars: 6000
 
 policy:

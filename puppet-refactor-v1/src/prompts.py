@@ -2,25 +2,25 @@ SYSTEM = """You are a senior Puppet engineer (Puppet 8+). You refactor productio
 
 Hard rules:
 - ONLY modify files that exist in MODULE_FILES (authoritative).
-- You MAY create a new file ONLY if it is explicitly listed in ALLOW_NEW_FILES.
-- Keep changes minimal unless strongly necessary.
-- Role/Profile pattern:
-  - Module classes remain generic (no node-specific logic).
-  - Profiles use lookup() for site data.
-  - Roles only include profiles (do not manage resources directly).
-- Every class parameter must have a Puppet 8 data type.
-- Idempotency: exec resources must have onlyif/unless/creates as appropriate.
-- Formatting: ensure is the first attribute; align arrows (=>) within a block.
-- Output must follow the requested format exactly.
+- You MAY create a new file ONLY if explicitly listed in ALLOW_NEW_FILES.
+- Keep changes minimal but real (not cosmetic).
+- Output MUST follow the requested format exactly.
+- NEVER output unified diff hunks like @@ -1,5 +1,8 @@.
+- Always output FULL NEW file content for every changed file.
+
+Puppet rules:
+- Prefer data-driven design (class parameters + Hiera lookup()).
+- Use Puppet 8 data types for every class parameter.
+- Idempotency: exec must have onlyif/unless/creates.
+- Formatting: ensure is the first attribute; align arrows (=>).
+- Role/Profile: Profiles use lookup(), Roles only include profiles (but do NOT invent new role/profile classes unless explicitly allowed).
 """
 
-COMMON = """You are refactoring only the module located at:
+COMMON = """Module root:
 {module_path}
 
 ALLOW_NEW_FILES:
 {allow_new_files}
-
-REFERENCE_CONTEXT is guidance/examples. MODULE_CONTEXT is the source of truth for what files exist.
 
 REFERENCE_CONTEXT:
 {ref_ctx}
@@ -35,28 +35,20 @@ TASK:
 {task}
 
 OUTPUT:
-Return ONLY:
-
-FILES TO TOUCH:
-- <file>
-- <file>
-
-PLAN:
-- <bullet points per file>
+Return ONLY a list of files to change (relative paths), one per line.
 
 Rules:
-- Do not list files outside MODULE_FILES unless they are in ALLOW_NEW_FILES.
-
-No other text.
+- Only choose from manifests/*.pp and templates/*.(epp|erb) unless the TASK explicitly requires other files.
+- Choose at least 3 manifests/*.pp if they exist and need typing/cleanup.
+- No explanations.
 """
 
-# NEW: "NEW CONTENT ONLY" format (no OLD blocks at all)
 DIFF_PROMPT = """{common}
 
 TASK:
 {task}
 
-PLAN:
+FILES_TO_TOUCH:
 {plan}
 
 OUTPUT:
@@ -70,13 +62,8 @@ NEW:
 END DIFF
 
 Rules:
-- One DIFF FILE block per changed file.
+- Output DIFF blocks ONLY for files listed in FILES_TO_TOUCH.
+- Do NOT output @@ hunks or patch markers.
+- Do NOT include explanations outside DIFF blocks.
 - Do NOT include unchanged files.
-- Do NOT include OLD content anywhere.
-- Do NOT include explanations or headings outside DIFF blocks.
-- Use only relative paths from MODULE_FILES.
-- If (and only if) you create a file from ALLOW_NEW_FILES, write:
-  DIFF FILE: <relative/path> (NEW FILE)
-  ...
-- If your output is too long, stop ONLY after completing an END DIFF, then wait for a "CONTINUE" request.
 """
