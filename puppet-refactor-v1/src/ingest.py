@@ -38,27 +38,16 @@ def git_sync(url: str, dest: str) -> None:
 
 
 def iter_files(root: str, pattern: str | List[str]) -> List[str]:
-    """
-    Proper glob semantics (supports **).
-    Also ensures root-level matches when pattern starts with "**/".
-    Accepts glob as string or list of strings.
-    """
     rootp = Path(root).resolve()
-    patterns: List[str]
-
-    if isinstance(pattern, list):
-        patterns = pattern[:]
-    else:
-        patterns = [pattern]
+    patterns: List[str] = pattern[:] if isinstance(pattern, list) else [pattern]
 
     out: List[str] = []
     seen: set[str] = set()
 
     for pat in patterns:
-        # If pattern is "**/*.md", also try "*.md" so README.md at repo root is included.
         pats = [pat]
         if pat.startswith("**/"):
-            pats.append(pat[3:])
+            pats.append(pat[3:])  # also try "*.md" for root files
 
         for one in pats:
             for p in rootp.glob(one):
@@ -72,9 +61,6 @@ def iter_files(root: str, pattern: str | List[str]) -> List[str]:
 
 
 def safe_text(path: str, max_bytes: int) -> str | None:
-    """
-    Cheap heuristic to skip binaries / huge files.
-    """
     try:
         st = os.stat(path)
         if st.st_size > max_bytes:
@@ -89,13 +75,6 @@ def safe_text(path: str, max_bytes: int) -> str | None:
 
 
 def normalize_source(src: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Accept slightly older/looser configs by inferring src.type when missing.
-
-    Supported:
-      - type: git (needs url + dest)
-      - type: dir (needs path)
-    """
     stype = (src.get("type") or "").strip()
 
     if not stype:
@@ -113,61 +92,72 @@ def normalize_source(src: Dict[str, Any]) -> Dict[str, Any]:
 
     out = dict(src)
     out["type"] = stype
+    out.setdefault("name", "unknown")
+    out.setdefault("glob", "**/*")
 
-    if not out.get("name"):
-        out["name"] = "unknown"
+    if out["type"] == "git" and (not out.get("url") or not out.get("dest")):
+        raise RuntimeError(f"Git source missing url/dest: {src}")
 
-    if out["type"] == "git":
-        if not out.get("url") or not out.get("dest"):
-            raise RuntimeError(f"Git source missing url/dest: {src}")
-
-    if out["type"] == "dir":
-        if not out.get("path"):
-            raise RuntimeError(f"Dir source missing path: {src}")
-
-    if not out.get("glob"):
-        out["glob"] = "**/*"
+    if out["type"] == "dir" and not out.get("path"):
+        raise RuntimeError(f"Dir source missing path: {src}")
 
     return out
+
+
+def cap_text_for_embedding(text: str, max_chars: int) -> str:
+    """
+    Keep embedding prompts bounded. This reduces Ollama failures and keeps ingestion fast.
+    (Embeddings don't need the entire file if it's huge.)
+    """
+    if max_chars <= 0:
+        return text
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[TRUNCATED FOR EMBEDDING]\n"
 
 
 def main() -> None:
     cfg = load_cfg()
 
-    # Basic config checks (keep v1 simple, but fail with clear errors)
-    if "ollama_url" not in cfg:
+    # minimal checks
+    ollama_url = cfg.get("ollama_url")
+    if not ollama_url:
         raise RuntimeError("Missing config key: ollama_url")
-    if "models" not in cfg or not isinstance(cfg["models"], dict):
-        raise RuntimeError("Missing config key: models")
-    if "embed" not in cfg["models"]:
+    models = cfg.get("models") or {}
+    embed_model = models.get("embed")
+    if not embed_model:
         raise RuntimeError("Missing config key: models.embed")
-    if "vector_store" not in cfg or not isinstance(cfg["vector_store"], dict):
-        raise RuntimeError("Missing config key: vector_store")
-    if "url" not in cfg["vector_store"] or "collection" not in cfg["vector_store"]:
+    vs = cfg.get("vector_store") or {}
+    if not vs.get("url") or not vs.get("collection"):
         raise RuntimeError("Missing config keys: vector_store.url / vector_store.collection")
-    if "ingestion" not in cfg or not isinstance(cfg["ingestion"], dict):
-        raise RuntimeError("Missing config key: ingestion")
-    if "batch_size" not in cfg["ingestion"]:
-        raise RuntimeError("Missing config key: ingestion.batch_size")
-    if "limits" not in cfg or not isinstance(cfg["limits"], dict):
-        raise RuntimeError("Missing config key: limits")
-    if "max_file_bytes" not in cfg["limits"]:
-        raise RuntimeError("Missing config key: limits.max_file_bytes")
+    ingestion = cfg.get("ingestion") or {}
+    batch_size = int(ingestion.get("batch_size", 32))
+    strategy = (ingestion.get("chunk_strategy") or "semantic").strip()
+    limits = cfg.get("limits") or {}
+    max_file_bytes = int(limits.get("max_file_bytes", 2_000_000))
+
+    # NEW: cap embedding input size to avoid Ollama 500s on large chunks
+    # (You can tune this later; 12k chars is a safe default)
+    max_embed_chars = int(limits.get("max_embed_chars", 12000))
+
     if "sources" not in cfg or not isinstance(cfg["sources"], list):
         raise RuntimeError("Missing config key: sources (must be a list)")
-
-    ollama = OllamaClient(cfg["ollama_url"])
-    store = QdrantStore(cfg["vector_store"]["url"], cfg["vector_store"]["collection"])
-
-    embed_model = cfg["models"]["embed"]
-    batch_size = int(cfg["ingestion"]["batch_size"])
-    max_bytes = int(cfg["limits"]["max_file_bytes"])
-    strategy = (cfg["ingestion"].get("chunk_strategy") or "semantic").strip()
-
-    # Normalize sources (fixes KeyError: 'type' and validates minimal keys)
     sources = [normalize_source(s) for s in cfg.get("sources", [])]
     if not sources:
         raise RuntimeError("No sources enabled in config.yaml (sources list is empty).")
+
+    ollama = OllamaClient(ollama_url)
+
+    # NEW: preflight check embedding model exists locally
+    local_models = set(ollama.list_models())
+    if embed_model not in local_models:
+        raise RuntimeError(
+            f"Embedding model '{embed_model}' not found in Ollama.\n"
+            f"Local models: {sorted(local_models)}\n"
+            f"Fix: run `ollama pull {embed_model}`"
+        )
+
+    store = QdrantStore(vs["url"], vs["collection"])
 
     jobs: List[Dict[str, Any]] = []
     for src in sources:
@@ -181,8 +171,6 @@ def main() -> None:
 
         glob_pat = src.get("glob", "**/*")
         matched = iter_files(root, glob_pat)
-
-        # Visibility: prevents “upserted=1” surprises
         print(
             f"[ingest] source={src['name']} type={stype} root={root} glob={glob_pat} matched_files={len(matched)}",
             flush=True,
@@ -196,34 +184,42 @@ def main() -> None:
     points: List[qm.PointStruct] = []
     collection_ready = False
     upserted = 0
+    embed_errors = 0
 
     for j in jobs:
-        text = safe_text(j["path"], max_bytes=max_bytes)
+        text = safe_text(j["path"], max_bytes=max_file_bytes)
         if text is None:
             continue
 
         rel = os.path.relpath(j["path"], j["root"]).replace(os.sep, "/")
 
-        # Semantic chunking for Puppet manifests when configured
         if j["path"].endswith(".pp") and strategy == "semantic":
             chunks = semantic_chunks_pp(text, rel)
         else:
             chunks = [f"File: {rel}\nBlock: raw\n---\n{text}"]
 
         for idx, ch in enumerate(chunks):
-            vec = ollama.embed(embed_model, ch)
+            # NEW: cap chunk size before embedding
+            ch2 = cap_text_for_embedding(ch, max_embed_chars)
+
+            try:
+                vec = ollama.embed(embed_model, ch2)
+            except Exception as e:
+                embed_errors += 1
+                print(f"[ingest] WARN embed_failed file={rel} chunk={idx} err={e}", flush=True)
+                continue
 
             if not collection_ready:
                 store.ensure_collection(dim=len(vec))
                 collection_ready = True
 
-            pid = uuid5(f"{j['source']}|{j['path']}|{idx}|{sha256(ch)}")
+            pid = uuid5(f"{j['source']}|{j['path']}|{idx}|{sha256(ch2)}")
             payload = {
                 "source": j["source"],
                 "path": j["path"],
                 "relpath": rel,
                 "chunk_index": idx,
-                "content": ch,
+                "content": ch2,
             }
             points.append(qm.PointStruct(id=pid, vector=vec, payload=payload))
 
@@ -236,7 +232,7 @@ def main() -> None:
         store.upsert(points)
         upserted += len(points)
 
-    print(f"[ingest] done upserted={upserted}", flush=True)
+    print(f"[ingest] done upserted={upserted} embed_errors={embed_errors}", flush=True)
 
 
 if __name__ == "__main__":

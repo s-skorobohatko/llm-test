@@ -7,10 +7,31 @@ class OllamaClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
 
+    def list_models(self) -> List[str]:
+        """
+        Returns a list of model names known to Ollama locally.
+        """
+        url = f"{self.base_url}/api/tags"
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        models = resp.json().get("models") or []
+        return [m.get("name", "") for m in models if m.get("name")]
+
     def embed(self, model: str, text: str) -> List[float]:
         url = f"{self.base_url}/api/embeddings"
-        resp = requests.post(url, json={"model": model, "prompt": text}, timeout=600)
-        resp.raise_for_status()
+        payload = {"model": model, "prompt": text}
+        resp = requests.post(url, json=payload, timeout=600)
+
+        if resp.status_code >= 400:
+            # Ollama often returns useful "error" in JSON body
+            detail = ""
+            try:
+                j = resp.json()
+                detail = j.get("error") or str(j)
+            except Exception:
+                detail = (resp.text or "").strip()
+            raise RuntimeError(f"Ollama embeddings error {resp.status_code}: {detail}")
+
         return resp.json()["embedding"]
 
     def chat(
@@ -35,5 +56,14 @@ class OllamaClient:
 
         payload = {"model": model, "messages": messages, "stream": False, "options": opts}
         resp = requests.post(url, json=payload, timeout=(10, int(timeout_sec)))
-        resp.raise_for_status()
+
+        if resp.status_code >= 400:
+            detail = ""
+            try:
+                j = resp.json()
+                detail = j.get("error") or str(j)
+            except Exception:
+                detail = (resp.text or "").strip()
+            raise RuntimeError(f"Ollama chat error {resp.status_code}: {detail}")
+
         return resp.json()["message"]["content"]
