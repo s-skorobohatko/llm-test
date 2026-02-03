@@ -1,0 +1,44 @@
+ollama_url: "http://127.0.0.1:11434"
+
+models:
+  embed: "nomic-embed-text"
+  chat: "qwen2.5-coder:7b-instruct-q4_K_M"
+
+vector_store:
+  provider: "qdrant"
+  url: "http://127.0.0.1:6333"
+  collection: "puppet_governance"
+
+limits:
+  num_ctx: 8192
+  num_predict_plan: 900
+  num_predict_diff: 1400
+  retrieve_top_k: 3
+  retrieve_max_chars: 18000
+  max_files_read: 200
+  max_file_bytes: 2000000
+  max_files_blob_chars: 140000
+
+ingestion:
+  batch_size: 32
+  chunk_strategy: "semantic"     # semantic | naive
+  naive_chunk_size: 1200
+  naive_chunk_overlap: 200
+
+sources:
+  - name: "official_style_guide"
+    type: "git"
+    url: "https://github.com/puppetlabs/language-style-guide.git"
+    dest: "./sources/vendor/puppetlabs/language-style-guide"
+    glob: "**/*.md"
+
+  - name: "wikimedia_guidelines"
+    type: "git"
+    url: "https://github.com/wikimedia/puppet-guidelines.git"
+    dest: "./sources/vendor/wikimedia/puppet-guidelines"
+    glob: "**/*.md"
+
+  - name: "internal_gold_standards"
+    type: "dir"
+    path: "/opt/puppet/gold_modules"
+    glob: "**/*.pp"

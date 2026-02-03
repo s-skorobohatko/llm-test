@@ -1,0 +1,1599 @@
+========================================
+FILE: rag_http.py
+========================================
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import subprocess
+import json
+
+app = FastAPI()
+
+
+class AskReq(BaseModel):
+    question: str
+    scope: str
+    topk: int = 6
+    minsim: float = 0.18
+    two_pass: bool = True
+    mode: str = "diff"  # diff | plan | both
+    ref_source: list[str] = []
+    prompt_dir: str | None = None
+
+
+@app.post("/ask")
+def ask(req: AskReq):
+    cmd = [
+        "python",
+        "ask.py",
+        "--json",
+        "--scope", req.scope,
+        "--topk", str(req.topk),
+        "--minsim", str(req.minsim),
+        "--mode", req.mode,
+    ]
+
+    if req.two_pass:
+        cmd.append("--two_pass")
+
+    for s in req.ref_source:
+        cmd += ["--ref_source", s]
+
+    if req.prompt_dir:
+        cmd += ["--prompt_dir", req.prompt_dir]
+
+    cmd.append(req.question)
+
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+        return json.loads(out)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=e.output)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="ask.py did not return valid JSON")
+
+
+========================================
+FILE: config.yaml
+========================================
+ollama_url: "http://127.0.0.1:11434"
+
+embed_model: "nomic-embed-text"
+chat_model: "puppet-expert"
+
+vector_store: "qdrant"
+qdrant_url: "http://127.0.0.1:6333"
+qdrant_collection: "puppet_chunks"
+
+ingest_log_file: "./ingest.log"
+ingest_verbose: false
+ingest_batch_size: 128
+
+chunk_size: 1200
+chunk_overlap: 200
+
+prompt_dir: "./prompts"
+
+default_ref_sources:
+  - "vendor:puppetlabs:best-practices"
+
+top_k: 6
+min_sim: 0.18
+
+sources:
+  - type: dir
+    name: "internal:module:iptables"
+    path: "/opt/llm/llm-test/iptables"
+    glob: "**/*"
+
+  - type: dir
+    name: "internal:module:keepalived"
+    path: "/opt/llm/llm-test/keepalived"
+    glob: "**/*"
+
+  - type: git
+    name: "vendor:puppetlabs:best-practices"
+    url: "https://github.com/puppetlabs/best-practices.git"
+    dest: "./sources/vendor/puppetlabs/best-practices"
+    glob: "**/*.md"
+
+  # - type: dir
+  #   name: "internal:control-repo"
+  #   path: "/srv/puppet/control-repo"
+  #   glob: "**/*.{pp,epp,md,yaml,yml,json}"
+
+  # - type: dir
+  #   name: "internal:modules"
+  #   path: "/srv/puppet/modules"
+  #   glob: "**/*.{pp,epp,md}"
+
+  - type: forge_discover
+    name: "forge:public:auto"
+    api_base: "https://forgeapi.puppet.com"
+    dest: "./sources/forge/public"
+    state_file: "./sources/forge/public/.state/forge_state.json"
+
+    include_globs:
+      - "**/*.pp"
+      - "**/*.epp"
+      - "metadata.json"
+      - "REFERENCE.md"
+      - "README*"
+
+    # Pagination / throttling
+    limit_per_page: 30
+    request_delay_sec: 1.0
+    download_delay_sec: 3.0
+
+    # Hard caps per run
+    max_modules_seen: 500
+    max_modules_synced: 
+
+    # Filters
+    only_owner: "puppetlabs"
+    only_with_repo: true
+
+    # Skip behavior (IMPORTANT)
+    index_unchanged: false
+    check_interval_hours: 24
+
+    # allowlist: ["puppetlabs-stdlib", "puppetlabs-apt"]
+    denylist: ["puppetlabs-java", "puppetlabs-nodejs", "puppetlabs-ruby", "puppetlabs-mysql", "puppetlabs-reboot", "puppetlabs-pe_gem", "puppetlabs-gcc", "puppetlabs-registry"]
+
+
+========================================
+FILE: ask_adhoc.py
+========================================
+#!/usr/bin/env python3
+import argparse
+import os
+import re
+import sys
+import tarfile
+import zipfile
+import tempfile
+from pathlib import Path
+from typing import List, Tuple, Dict, Any
+
+import numpy as np
+import yaml
+
+from raglib import OllamaClient, chunk_text, load_text_file, sha256_str
+
+
+DEFAULT_INCLUDE = [
+    "**/*.pp",
+    "**/*.epp",
+    "**/*.md",
+    "**/*.markdown",
+    "**/*.yml",
+    "**/*.yaml",
+    "metadata.json",
+    "README*",
+    "REFERENCE.md",
+]
+
+
+SYSTEM_PUPPET = """You are a senior Puppet engineer (Puppet 8+). You write and refactor production-grade Puppet code and modules.
+
+Rules:
+- Prefer data-driven design: class parameters + Hiera (lookup()).
+- Remove legacy patterns: params.pp, validate_* functions, unnecessary inheritance.
+- Ensure idempotency and correct resource ordering.
+- Use modern Puppet types and EPP templates.
+- State assumptions briefly.
+- Cite retrieved snippets like [1], [2] when you rely on them.
+
+Output formatting:
+- Put code in fenced blocks.
+- If output is long, continue rather than truncating.
+"""
+
+
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def extract_archive(archive_path: str, dest_dir: str) -> str:
+    ap = archive_path.lower()
+    if ap.endswith(".zip"):
+        with zipfile.ZipFile(archive_path, "r") as z:
+            z.extractall(dest_dir)
+    elif ap.endswith(".tar.gz") or ap.endswith(".tgz") or ap.endswith(".tar"):
+        mode = "r:gz" if (ap.endswith(".tar.gz") or ap.endswith(".tgz")) else "r:"
+        with tarfile.open(archive_path, mode) as t:
+            # basic safety: prevent path traversal
+            for m in t.getmembers():
+                p = os.path.abspath(os.path.join(dest_dir, m.name))
+                if not p.startswith(os.path.abspath(dest_dir) + os.sep) and p != os.path.abspath(dest_dir):
+                    raise RuntimeError(f"Unsafe path in tar: {m.name}")
+            t.extractall(dest_dir)
+    else:
+        raise ValueError("Unsupported archive. Use .zip, .tar.gz, .tgz, or .tar")
+    return dest_dir
+
+
+def glob_files(root: str, patterns: List[str]) -> List[str]:
+    out: List[str] = []
+    rootp = Path(root)
+    for pat in patterns:
+        out.extend([str(p) for p in rootp.glob(pat) if p.is_file()])
+    # dedupe
+    seen = set()
+    uniq = []
+    for p in out:
+        if p not in seen:
+            uniq.append(p)
+            seen.add(p)
+    return uniq
+
+
+def build_prompt(question: str, contexts: List[Tuple[float, Dict[str, Any]]]) -> str:
+    if not contexts:
+        return question
+
+    lines = ["You have these retrieved snippets. Use them when relevant:\n"]
+    for idx, (score, meta) in enumerate(contexts, start=1):
+        rel = meta["relpath"]
+        chunk_index = meta["chunk_index"]
+        content = meta["content"]
+        lines.append(f"[{idx}] score={score:.3f} {rel}#chunk{chunk_index}\n{content}\n")
+    lines.append("User question:\n" + question)
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Ad-hoc Puppet module RAG: point to a module folder or archive; no DB needed."
+    )
+    ap.add_argument("question", help="Your question to the model")
+    ap.add_argument("--path", required=True, help="Path to module directory OR archive (.zip/.tar.gz/.tgz/.tar)")
+    ap.add_argument("--include", action="append", help="Extra glob to include (repeatable)")
+    ap.add_argument("--topk", type=int, default=12, help="How many chunks to include in context")
+    ap.add_argument("--minsim", type=float, default=0.10, help="Minimum similarity threshold")
+    ap.add_argument("--chunk-size", type=int, default=None)
+    ap.add_argument("--chunk-overlap", type=int, default=None)
+    ap.add_argument("--max-files", type=int, default=300, help="Safety cap for number of files read")
+    ap.add_argument("--max-chunks", type=int, default=3000, help="Safety cap for number of chunks embedded")
+    ap.add_argument("--num-predict", type=int, default=900, help="Output token cap")
+    args = ap.parse_args()
+
+    with open("config.yaml", "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    client = OllamaClient(cfg["ollama_url"])
+    embed_model = cfg["embed_model"]
+    chat_model = cfg["chat_model"]
+
+    chunk_size = int(args.chunk_size if args.chunk_size is not None else cfg.get("chunk_size", 1200))
+    chunk_overlap = int(args.chunk_overlap if args.chunk_overlap is not None else cfg.get("chunk_overlap", 200))
+
+    src_path = os.path.abspath(args.path)
+
+    with tempfile.TemporaryDirectory(prefix="adhoc_module_") as td:
+        if os.path.isdir(src_path):
+            module_root = src_path
+        else:
+            # archive -> extract
+            extract_archive(src_path, td)
+            # pick the first directory that looks like a module root
+            # (either extracted root itself, or first subdir)
+            candidates = [td] + [str(p) for p in Path(td).iterdir() if p.is_dir()]
+            module_root = candidates[0]
+
+        patterns = list(DEFAULT_INCLUDE)
+        if args.include:
+            patterns.extend(args.include)
+
+        files = glob_files(module_root, patterns)
+        if not files:
+            print("No files matched include patterns. Try --include '**/*' or check the path.", file=sys.stderr)
+            sys.exit(2)
+
+        if len(files) > args.max_files:
+            files = files[: args.max_files]
+
+        # Embed the question
+        q_vec = np.array(client.embed(embed_model, args.question), dtype=np.float32)
+
+        # Build chunk list and embed chunks (in-memory)
+        candidates: List[Tuple[float, Dict[str, Any]]] = []
+        total_chunks = 0
+
+        for fp in files:
+            try:
+                text = load_text_file(fp)
+            except Exception:
+                continue
+
+            rel = os.path.relpath(fp, module_root)
+            chunks = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
+            if not chunks:
+                continue
+
+            for i, ch in enumerate(chunks):
+                total_chunks += 1
+                if total_chunks > args.max_chunks:
+                    break
+
+                vec = np.array(client.embed(embed_model, ch), dtype=np.float32)
+                sim = cosine_sim(q_vec, vec)
+                if sim >= args.minsim:
+                    candidates.append(
+                        (
+                            sim,
+                            {
+                                "relpath": rel,
+                                "chunk_index": i,
+                                "content": ch,
+                                "content_hash": sha256_str(ch),
+                            },
+                        )
+                    )
+
+            if total_chunks > args.max_chunks:
+                break
+
+        # Pick top-K
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        contexts = candidates[: args.topk]
+
+        print("=== Retrieved context (ad-hoc) ===")
+        if not contexts:
+            print("(none)  (Try lowering --minsim or increasing --max-chunks)")
+        else:
+            for idx, (score, meta) in enumerate(contexts, start=1):
+                print(f"[{idx}] sim={score:.3f} {meta['relpath']}#chunk{meta['chunk_index']}")
+
+        prompt = build_prompt(args.question, contexts)
+
+        print("\n=== Answer ===")
+        client.chat(
+            model=chat_model,
+            system=SYSTEM_PUPPET,
+            user=prompt,
+            options={"num_predict": args.num_predict},
+            stream=True,
+            timeout=3600,
+        )
+
+
+if __name__ == "__main__":
+    main()
+
+
+========================================
+FILE: ask.py
+========================================
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import yaml
+
+from raglib import OllamaClient
+from qdrant_store import QdrantStore
+
+Hit = Tuple[float, Dict[str, Any]]
+
+
+def must_source(value: str) -> Dict[str, Any]:
+    return {"key": "source", "match": {"value": value}}
+
+
+def must_path_contains(text: str) -> Dict[str, Any]:
+    return {"key": "path", "match": {"text": text}}
+
+
+def must_module_root(value: str) -> Dict[str, Any]:
+    return {"key": "module_root", "match": {"value": value}}
+
+
+def require_keys(cfg: Dict[str, Any], keys: List[str], where: str) -> None:
+    missing = [k for k in keys if k not in cfg or cfg[k] in (None, "")]
+    if missing:
+        raise SystemExit(f"Missing config keys in {where}: {', '.join(missing)}")
+
+
+def read_question(positional: Optional[str]) -> str:
+    if positional is None:
+        q = sys.stdin.read().strip()
+        if not q:
+            print("No question provided (arg or stdin).", file=sys.stderr)
+            sys.exit(2)
+        return q
+    q = positional.strip()
+    if not q:
+        print("Empty question provided.", file=sys.stderr)
+        sys.exit(2)
+    return q
+
+
+def format_context(items: List[Hit], title: str, limit: Optional[int] = None) -> str:
+    blocks: List[str] = []
+    for i, (score, payload) in enumerate(items, start=1):
+        if limit is not None and i > limit:
+            break
+
+        content = payload.get("content", "") or ""
+        src = payload.get("source", "") or ""
+        module_root = payload.get("module_root", "") or ""
+        path = payload.get("path", "") or ""
+        relpath = payload.get("relpath", "") or ""
+        chunk_idx = payload.get("chunk_index", "")
+
+        blocks.append(
+            f"[{i}] source={src} module_root={module_root} relpath={relpath} "
+            f"path={path} chunk={chunk_idx} sim={score:.3f}\n{content}"
+        )
+
+    joined = "\n\n---\n\n".join(blocks).strip()
+    return f"{title}\n{joined}\n"
+
+
+def clamp_scoped_minsim(min_sim: float) -> float:
+    return min_sim if min_sim <= 0.10 else 0.06
+
+
+def load_prompt(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def prompt_path(prompt_dir: str, name: str) -> str:
+    return os.path.join(prompt_dir, name)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Ask with RAG (Qdrant + Ollama), non-streaming.")
+    ap.add_argument("question", nargs="?", help="Question to ask (or use stdin if omitted)")
+    ap.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    ap.add_argument("--prompt_dir", default=None, help="Directory with prompt templates")
+
+    ap.add_argument("--topk", type=int, default=None, help="Top-k for MODULE retrieval (scoped)")
+    ap.add_argument("--minsim", type=float, default=None, help="Minimum similarity threshold")
+    ap.add_argument("--scope", default=None, help="Module root path (module_root). Required.")
+
+    ap.add_argument("--ref_source", action="append", default=[], help="Reference source name (repeatable)")
+    ap.add_argument("--ref_topk", type=int, default=12, help="Top-k for REFERENCE retrieval (per run)")
+
+    ap.add_argument("--show_context", type=int, default=30, help="How many retrieved items to print per section")
+    ap.add_argument("--json", action="store_true", help="Output JSON (answer + retrieval + timings)")
+
+    ap.add_argument("--two_pass", action="store_true", help="Run plan pass first, then diff pass")
+    ap.add_argument("--mode", choices=["diff", "plan", "both"], default="diff")
+
+    ap.add_argument("--timeout_sec", type=int, default=1800, help="Timeout per model call (seconds)")
+
+    args = ap.parse_args()
+    question = read_question(args.question)
+
+    if not args.scope:
+        print("ERROR: --scope is required (prevents hallucinated file paths).", file=sys.stderr)
+        sys.exit(2)
+
+    with open(args.config, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    require_keys(cfg, ["ollama_url", "embed_model", "chat_model", "qdrant_url", "qdrant_collection"], args.config)
+
+    if cfg.get("vector_store") and cfg["vector_store"] != "qdrant":
+        raise SystemExit("config.yaml vector_store must be 'qdrant' (or omit vector_store)")
+
+    ollama_url = cfg["ollama_url"]
+    embed_model = cfg["embed_model"]
+    chat_model = cfg["chat_model"]
+    qdrant_url = cfg["qdrant_url"]
+    collection = cfg["qdrant_collection"]
+
+    top_k_module = args.topk if args.topk is not None else int(cfg.get("top_k", 6))
+    min_sim = args.minsim if args.minsim is not None else float(cfg.get("min_sim", 0.18))
+
+    default_ref_sources = list(cfg.get("default_ref_sources") or ["vendor:puppetlabs:best-practices"])
+    ref_sources = args.ref_source[:] if args.ref_source else default_ref_sources
+
+    prompt_dir = args.prompt_dir or cfg.get("prompt_dir") or "./prompts"
+    common_rules_tpl = load_prompt(prompt_path(prompt_dir, "common_rules.txt"))
+    plan_tpl = load_prompt(prompt_path(prompt_dir, "plan.txt"))
+    diff_tpl = load_prompt(prompt_path(prompt_dir, "diff.txt"))
+
+    client = OllamaClient(ollama_url)
+    store = QdrantStore(qdrant_url, collection)
+
+    t0 = time.time()
+
+    # Embed query
+    q_vec = client.embed(embed_model, question)
+
+    # MODULE retrieval
+    scoped_min_sim = clamp_scoped_minsim(min_sim)
+    module_hits = store.search(
+        query_vector=q_vec,
+        top_k=max(top_k_module, 60),
+        min_sim=scoped_min_sim,
+        must=[must_module_root(args.scope)],
+    )
+    if not module_hits:
+        module_hits = store.search(
+            query_vector=q_vec,
+            top_k=max(top_k_module, 60),
+            min_sim=scoped_min_sim,
+            must=[must_path_contains(args.scope)],
+        )
+
+    # REFERENCE retrieval
+    ref_hits_all: List[Hit] = []
+    per_src = max(4, args.ref_topk // max(1, len(ref_sources)))
+    for src in ref_sources:
+        ref_hits_all.extend(
+            store.search(
+                query_vector=q_vec,
+                top_k=per_src,
+                min_sim=0.12,
+                must=[must_source(src)],
+            )
+        )
+    ref_hits_all.sort(key=lambda x: x[0], reverse=True)
+    ref_hits = ref_hits_all[: args.ref_topk]
+
+    # Diagnostics
+    if not args.json:
+        print("=== Retrieved context (MODULE) ===")
+        for i, (score, payload) in enumerate(module_hits[: args.show_context], start=1):
+            p = payload.get("relpath") or payload.get("path") or "?"
+            print(f"[{i}] sim={score:.3f} {payload.get('source','?')} {p}#chunk{payload.get('chunk_index','?')}")
+
+        print("\n=== Retrieved context (REFERENCE) ===")
+        for i, (score, payload) in enumerate(ref_hits[: args.show_context], start=1):
+            print(f"[{i}] sim={score:.3f} {payload.get('source','?')} {payload.get('path','?')}#chunk{payload.get('chunk_index','?')}")
+
+    # Build contexts
+    module_ctx = format_context(module_hits, "MODULE_CONTEXT (authoritative; only these files exist):", None)
+    ref_ctx = format_context(ref_hits, "REFERENCE_CONTEXT (authoritative Puppet guidance):", None)
+
+    # Render prompts from files
+    common_rules = common_rules_tpl.format(scope=args.scope, ref_ctx=ref_ctx, module_ctx=module_ctx)
+    plan_prompt = plan_tpl.format(common_rules=common_rules, question=question)
+    diff_prompt = diff_tpl.format(common_rules=common_rules, question=question)
+
+    def run_model(prompt_text: str) -> str:
+        messages = [
+            {"role": "system", "content": "You are a Puppet expert assistant. Follow the formatting rules exactly."},
+            {"role": "user", "content": prompt_text},
+        ]
+        return client.chat(
+            model=chat_model,
+            messages=messages,
+            timeout_sec=args.timeout_sec,
+        ).strip()
+
+    # Generate
+    plan_text = ""
+    if args.two_pass or args.mode in ("plan", "both"):
+        plan_text = run_model(plan_prompt)
+
+    if args.mode == "plan":
+        final_answer = plan_text
+    else:
+        diff_prompt2 = diff_prompt
+        if args.two_pass and plan_text.strip():
+            diff_prompt2 = diff_prompt + "\n\nCONSTRAINT: Follow this plan:\n" + plan_text
+        diff_text = run_model(diff_prompt2)
+        final_answer = diff_text
+
+    dt = time.time() - t0
+
+    result = {
+        "answer": final_answer,
+        "elapsed_sec": round(dt, 3),
+        "scope": args.scope,
+        "run": {
+            "two_pass": bool(args.two_pass),
+            "mode": args.mode,
+            "topk_module": int(top_k_module),
+            "minsim": float(min_sim),
+            "ref_sources": ref_sources,
+            "ref_topk": int(args.ref_topk),
+            "prompt_dir": prompt_dir,
+            "timeout_sec": int(args.timeout_sec),
+        },
+        "retrieval": {
+            "module": [
+                {
+                    "score": float(score),
+                    "source": payload.get("source", ""),
+                    "module_root": payload.get("module_root", ""),
+                    "path": payload.get("path", ""),
+                    "relpath": payload.get("relpath", ""),
+                    "chunk_index": payload.get("chunk_index", ""),
+                }
+                for (score, payload) in module_hits[: args.show_context]
+            ],
+            "reference": [
+                {
+                    "score": float(score),
+                    "source": payload.get("source", ""),
+                    "path": payload.get("path", ""),
+                    "chunk_index": payload.get("chunk_index", ""),
+                }
+                for (score, payload) in ref_hits[: args.show_context]
+            ],
+        },
+    }
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print("\n=== Answer ===")
+        print(final_answer)
+        print(f"\n[ask] elapsed_sec={dt:.1f}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
+
+
+========================================
+FILE: ingest.py
+========================================
+#!/usr/bin/env python3
+import argparse
+import os
+import time
+import yaml
+from typing import Optional
+
+from raglib import (
+    OllamaClient,
+    load_text_file,
+    chunk_text,
+    sha256_str,
+    uuid5_str,
+    git_sync,
+    list_files_from_dir,
+    list_files_multi_glob,
+)
+
+from qdrant_store import QdrantStore
+
+
+def ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(msg: str) -> None:
+    print(f"{ts()} {msg}", flush=True)
+
+
+def safe_is_text_file(path: str, max_bytes: int = 2_000_000) -> bool:
+    """
+    Cheap heuristic to avoid binary / huge files.
+    """
+    try:
+        st = os.stat(path)
+        if st.st_size > max_bytes:
+            return False
+        with open(path, "rb") as f:
+            head = f.read(4096)
+        if b"\x00" in head:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def require_keys(cfg: dict, keys: list[str], where: str) -> None:
+    missing = [k for k in keys if k not in cfg or cfg[k] in (None, "")]
+    if missing:
+        raise SystemExit(f"Missing config keys in {where}: {', '.join(missing)}")
+
+
+def collect_files_from_source(src: dict) -> list[str]:
+    stype = src["type"]
+
+    if stype == "git":
+        git_sync(src["url"], src["dest"], depth=int(src.get("depth", 1)))
+        return list_files_from_dir(src["dest"], src["glob"])
+
+    if stype == "dir":
+        root = src["path"]
+        globp = src.get("glob", "**/*")
+        return list_files_from_dir(root, globp)
+
+    if stype == "forge_discover":
+        # indexes whatever already exists in dest
+        dest = src["dest"]
+        include_globs = src.get("include_globs") or []
+        if include_globs:
+            return list_files_multi_glob(dest, include_globs)
+        return list_files_from_dir(dest, "**/*")
+
+    raise ValueError(f"Unknown source type: {stype}")
+
+
+def source_module_root(src: dict) -> str:
+    """
+    Determine a stable module_root for payload scoping.
+
+    This should match what you'll pass to ask.py --scope.
+    """
+    stype = src.get("type")
+
+    if stype == "dir":
+        return (src.get("path") or "").rstrip("/")
+
+    if stype == "git":
+        return (src.get("dest") or "").rstrip("/")
+
+    if stype == "forge_discover":
+        # This is the dest root; scoping by module_root for forge is less useful,
+        # but still consistent if you want it.
+        return (src.get("dest") or "").rstrip("/")
+
+    return ""
+
+
+def compute_relpath(module_root: str, path: str) -> str:
+    """
+    Compute relpath if path is under module_root. Otherwise return empty.
+    Normalize to forward slashes for stable printing/prompts.
+    """
+    try:
+        mr = os.path.abspath(module_root)
+        p = os.path.abspath(path)
+        if mr and os.path.commonpath([mr, p]) == mr:
+            return os.path.relpath(p, mr).replace(os.sep, "/")
+    except Exception:
+        pass
+    return ""
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="./config.yaml")
+    ap.add_argument("--batch", type=int, default=64, help="Upsert batch size (points)")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    require_keys(cfg, ["ollama_url", "embed_model", "qdrant_url", "qdrant_collection", "sources"], args.config)
+
+    ollama = OllamaClient(cfg["ollama_url"])
+    store = QdrantStore(cfg["qdrant_url"], cfg["qdrant_collection"])
+
+    chunk_size = int(cfg.get("chunk_size", 1200))
+    chunk_overlap = int(cfg.get("chunk_overlap", 200))
+
+    sources = cfg.get("sources", [])
+    if not sources:
+        raise SystemExit("No sources in config")
+
+    # Collect files in CONFIG ORDER
+    file_jobs: list[tuple[str, dict, str, str]] = []  # (source_name, src, module_root, file_path)
+    for src in sources:
+        name = src["name"]
+        try:
+            module_root = source_module_root(src)
+            files = collect_files_from_source(src)
+            for fp in files:
+                file_jobs.append((name, src, module_root, fp))
+        except Exception as e:
+            log(f"[ERROR] source={name} err={e}")
+
+    log(f"[ingest] Found {len(file_jobs)} files to index (config order)")
+
+    # counts before
+    total_before = store.count()
+    log(f"[qdrant] total points before: {total_before}")
+    for src in sources:
+        name = src["name"]
+        try:
+            c = store.count(must=[{"key": "source", "match": {"value": name}}])
+            log(f"[qdrant] before source={name} points={c}")
+        except Exception as e:
+            log(f"[qdrant] before source={name} err={e}")
+
+    errors = 0
+    upserted = 0
+    t0 = time.time()
+
+    batch_points = []
+    collection_ready = False
+
+    for i, (source_name, src, module_root, path) in enumerate(file_jobs, start=1):
+        try:
+            log(f"[ingest] {i}/{len(file_jobs)} {path}")
+
+            if not safe_is_text_file(path):
+                continue
+
+            text = load_text_file(path)
+            chunks = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
+
+            relpath = compute_relpath(module_root, path)
+
+            for chunk_index, chunk in enumerate(chunks):
+                vec = ollama.embed(cfg["embed_model"], chunk)
+
+                if not collection_ready:
+                    store.ensure_collection(dim=len(vec))
+                    collection_ready = True
+
+                chunk_hash = sha256_str(chunk)
+                point_id = uuid5_str(f"{source_name}|{path}|{chunk_index}|{chunk_hash}")
+
+                payload = {
+                    "source": source_name,
+                    "module_root": module_root,
+                    "path": path,
+                    "relpath": relpath,
+                    "chunk_id": f"{os.path.basename(path)}#chunk{chunk_index}",
+                    "chunk_index": chunk_index,
+                    "content": chunk,
+                }
+
+                pt = store.make_point(id=point_id, vector=vec, payload=payload)
+                batch_points.append(pt)
+
+                if len(batch_points) >= args.batch:
+                    store.upsert_points(batch_points)
+                    upserted += len(batch_points)
+                    batch_points = []
+
+        except Exception as e:
+            errors += 1
+            log(f"[ERROR] source={source_name} path={path} err={e}")
+
+    if batch_points:
+        store.upsert_points(batch_points)
+        upserted += len(batch_points)
+
+    elapsed = time.time() - t0
+
+    total_after = store.count()
+    log(f"[qdrant] total points after: {total_after} (delta={total_after - total_before})")
+    for src in sources:
+        name = src["name"]
+        try:
+            c = store.count(must=[{"key": "source", "match": {"value": name}}])
+            log(f"[qdrant] after source={name} points={c}")
+        except Exception as e:
+            log(f"[qdrant] after source={name} err={e}")
+
+    log(f"[ingest] Done. upserted_points={upserted} errors={errors} elapsed_sec={elapsed:.1f}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+========================================
+FILE: prompts/diff.txt
+========================================
+{common_rules}
+
+TASK:
+{question}
+
+OUTPUT:
+For each changed file, output a diff using the following EXACT format.
+
+DIFF FILE: <path>
+--------------------------------
+OLD:
+<only the relevant original lines>
+
+NEW:
+<the modified lines>
+--------------------------------
+END DIFF
+
+RULES:
+- Use real paths that exist in MODULE_CONTEXT.
+- One DIFF FILE block per file.
+- Do NOT include unchanged files.
+- If you create a new file, use:
+
+DIFF FILE: <path> (NEW FILE)
+--------------------------------
+NEW:
+<full file content>
+--------------------------------
+END DIFF
+
+- Keep changes minimal unless REFERENCE_CONTEXT strongly supports a larger refactor.
+
+
+========================================
+FILE: prompts/plan.txt
+========================================
+{common_rules}
+
+TASK:
+{question}
+
+OUTPUT:
+1) FILES TO TOUCH (existing files only; from MODULE_CONTEXT).
+2) CHANGE PLAN (bullet points per file).
+3) REFERENCE JUSTIFICATION mapping key plan items -> REF [n].
+
+
+========================================
+FILE: prompts/common_rules.txt
+========================================
+You must refactor ONLY the module under: {scope}
+
+RAG-FIRST RULES:
+- Use MODULE_CONTEXT to know what files/classes/params actually exist.
+- Use REFERENCE_CONTEXT to decide HOW to refactor (Puppet best practices, patterns, examples).
+- Do NOT invent file paths. Only change existing MODULE files, unless you explicitly justify creating a new file.
+- Avoid copying large context verbatim. Quote only small snippets if needed.
+- For each non-trivial refactor decision, cite at least one reference chunk like: (REF [n]).
+- When changing code, be idempotent and Puppet-idiomatic.
+
+{ref_ctx}
+
+{module_ctx}
+
+
+========================================
+FILE: qdrant_store.py
+========================================
+from typing import Any, Dict, List, Optional, Tuple
+
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qm
+
+
+def _field_condition(cond: Dict[str, Any]) -> qm.FieldCondition:
+    key = cond["key"]
+    m = cond["match"]
+    if "value" in m:
+        return qm.FieldCondition(key=key, match=qm.MatchValue(value=m["value"]))
+    if "text" in m:
+        return qm.FieldCondition(key=key, match=qm.MatchText(text=m["text"]))
+    raise ValueError(f"Unsupported match in condition: {cond}")
+
+
+def _make_filter(must: Optional[List[Dict[str, Any]]]) -> Optional[qm.Filter]:
+    if not must:
+        return None
+    return qm.Filter(must=[_field_condition(c) for c in must])
+
+
+class QdrantStore:
+    def __init__(self, url: str, collection: str):
+        self.client = QdrantClient(url=url)
+        self.collection = collection
+
+    # ---------- collection ----------
+    def ensure_collection(self, dim: int) -> None:
+        cols = self.client.get_collections().collections
+        if any(c.name == self.collection for c in cols):
+            return
+
+        self.client.create_collection(
+            collection_name=self.collection,
+            vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
+        )
+
+    # ---------- ingest helpers ----------
+    def make_point(self, *args, **kwargs) -> qm.PointStruct:
+        """
+        Backward compatible builder.
+
+        Supports BOTH:
+          A) make_point(point_id, vector, payload)
+          B) make_point(id=..., vector=..., source=..., path=..., content=..., chunk_id=..., meta=...)
+        """
+        # style A: positional
+        if len(args) == 3 and not kwargs:
+            point_id, vector, payload = args
+            return qm.PointStruct(id=point_id, vector=vector, payload=payload)
+
+        # style B: keyword args
+        point_id = kwargs.pop("id", None) or kwargs.pop("point_id", None)
+        vector = kwargs.pop("vector", None) or kwargs.pop("embedding", None)
+        if point_id is None or vector is None:
+            raise TypeError("make_point requires id/point_id and vector/embedding")
+
+        payload: Dict[str, Any] = {}
+
+        # allow explicit payload
+        p = kwargs.pop("payload", None)
+        if isinstance(p, dict):
+            payload.update(p)
+
+        # common fields
+        for k in [
+            "source", "path", "relpath", "chunk_id", "chunk_index", "content",
+            "lang", "mtime", "sha256", "url", "file_sha256",
+        ]:
+            if k in kwargs:
+                payload[k] = kwargs.pop(k)
+
+        meta = kwargs.pop("meta", None)
+        if isinstance(meta, dict):
+            payload.update(meta)
+
+        # any remaining kwargs
+        payload.update(kwargs)
+
+        return qm.PointStruct(id=point_id, vector=vector, payload=payload)
+
+    def upsert_points(self, points: List[qm.PointStruct]) -> None:
+        self.client.upsert(collection_name=self.collection, points=points)
+
+    # alias (some code uses store.upsert)
+    def upsert(self, points: List[qm.PointStruct]) -> None:
+        self.upsert_points(points)
+
+    def count(self, must: Optional[List[Dict[str, Any]]] = None) -> int:
+        flt = _make_filter(must)
+        res = self.client.count(collection_name=self.collection, count_filter=flt, exact=True)
+        return int(res.count)
+
+    # ---------- search ----------
+    def search(
+        self,
+        query_vector: List[float],
+        top_k: int,
+        min_sim: float,
+        must: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Tuple[float, Dict[str, Any]]]:
+        """Return list of (score, payload)."""
+        flt = _make_filter(must)
+
+        if hasattr(self.client, "search"):
+            hits = self.client.search(
+                collection_name=self.collection,
+                query_vector=query_vector,
+                limit=top_k,
+                with_payload=True,
+                score_threshold=min_sim,
+                query_filter=flt,
+            )
+            return [(float(h.score), dict(h.payload or {})) for h in hits]
+
+        if hasattr(self.client, "query_points"):
+            try:
+                res = self.client.query_points(
+                    collection_name=self.collection,
+                    query=query_vector,
+                    limit=top_k,
+                    with_payload=True,
+                    score_threshold=min_sim,
+                    query_filter=flt,
+                )
+            except TypeError:
+                res = self.client.query_points(
+                    collection_name=self.collection,
+                    vector=query_vector,
+                    limit=top_k,
+                    with_payload=True,
+                    score_threshold=min_sim,
+                    query_filter=flt,
+                )
+
+            points = getattr(res, "points", res)
+            out = []
+            for p in points:
+                score = getattr(p, "score", None)
+                payload = getattr(p, "payload", None)
+                if score is None and isinstance(p, dict):
+                    score = p.get("score")
+                    payload = p.get("payload")
+                out.append((float(score), dict(payload or {})))
+            return out
+
+        # last resort: HTTP
+        req = qm.SearchRequest(
+            vector=query_vector,
+            limit=top_k,
+            with_payload=True,
+            score_threshold=min_sim,
+            filter=flt,
+        )
+        hits = self.client.http.search(collection_name=self.collection, search_request=req)
+        return [(float(h.score), dict(h.payload or {})) for h in hits]
+
+
+========================================
+FILE: qdrant-compose.yml
+========================================
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"   # HTTP
+      - "6334:6334"   # gRPC (optional)
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+
+
+========================================
+FILE: forge.py
+========================================
+import os
+import re
+import time
+import json
+import tarfile
+import requests
+import subprocess
+from typing import Dict, Any, List, Optional, Tuple
+
+
+GIT_URL_RE = re.compile(r"^(https?|git)://|^git@")
+
+
+def is_probable_git_repo(url: str) -> bool:
+    if not url:
+        return False
+    return bool(GIT_URL_RE.search(url.strip()))
+
+
+def safe_mkdir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+
+def atomic_write_json(path: str, obj: dict) -> None:
+    safe_mkdir(os.path.dirname(path))
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def load_state(path: str) -> dict:
+    if not path or not os.path.isfile(path):
+        return {"modules": {}}
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except Exception:
+            return {"modules": {}}
+
+
+def save_state(path: str, state: dict) -> None:
+    atomic_write_json(path, state)
+
+
+def get_state_entry(state: dict, slug: str) -> Optional[Tuple[str, str, int]]:
+    ent = (state.get("modules") or {}).get(slug)
+    if not ent:
+        return None
+    return (
+        ent.get("last_version", "") or "",
+        ent.get("last_kind", "") or "",
+        int(ent.get("last_checked", 0) or 0),
+    )
+
+
+def upsert_state_entry(state: dict, slug: str, version: str, kind: str) -> None:
+    mods = state.setdefault("modules", {})
+    mods[slug] = {
+        "last_version": version,
+        "last_kind": kind,
+        "last_checked": int(time.time()),
+    }
+
+
+def git_sync(url: str, dest: str) -> None:
+    safe_mkdir(os.path.dirname(dest))
+    if os.path.isdir(dest) and os.path.isdir(os.path.join(dest, ".git")):
+        subprocess.check_call(["git", "-C", dest, "pull", "--ff-only"])
+    else:
+        subprocess.check_call(["git", "clone", "--depth", "1", url, dest])
+
+
+def forge_list_modules(api_base: str, limit: int, offset: int) -> Dict[str, Any]:
+    url = f"{api_base.rstrip('/')}/v3/modules"
+    r = requests.get(url, params={"limit": limit, "offset": offset}, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+def forge_get_module(api_base: str, slug: str) -> Dict[str, Any]:
+    url = f"{api_base.rstrip('/')}/v3/modules/{slug}"
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+def forge_download_file(api_base: str, file_uri: str, dest_path: str) -> None:
+    safe_mkdir(os.path.dirname(dest_path))
+    url = f"{api_base.rstrip('/')}{file_uri}"
+    with requests.get(url, stream=True, timeout=180) as r:
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 512):
+                if chunk:
+                    f.write(chunk)
+
+
+def safe_extract_tgz(tgz_path: str, dest_dir: str) -> None:
+    safe_mkdir(dest_dir)
+
+    def is_within_directory(directory: str, target: str) -> bool:
+        abs_directory = os.path.abspath(directory)
+        abs_target = os.path.abspath(target)
+        return os.path.commonpath([abs_directory]) == os.path.commonpath([abs_directory, abs_target])
+
+    with tarfile.open(tgz_path, "r:gz") as tar:
+        for member in tar.getmembers():
+            member_path = os.path.join(dest_dir, member.name)
+            if not is_within_directory(dest_dir, member_path):
+                raise RuntimeError(f"Unsafe tar path traversal detected: {member.name}")
+        tar.extractall(dest_dir)
+
+
+def slug_to_paths(dest_root: str, slug: str) -> Tuple[str, str, str]:
+    if "-" in slug:
+        owner, name = slug.split("-", 1)
+    else:
+        owner, name = slug, "unknown"
+    base_dir = os.path.join(dest_root, owner, name)
+    return owner, name, base_dir
+
+
+def discover_and_sync_forge(
+    api_base: str,
+    dest_root: str,
+    include_globs: List[str],
+    state_file: str,
+    limit_per_page: int = 50,
+    max_modules_seen: int = 500,
+    max_modules_synced: int = 50,
+    request_delay_sec: float = 0.5,
+    download_delay_sec: float = 1.0,
+    only_with_repo: bool = True,
+    only_owner: Optional[str] = None,
+    allowlist: Optional[List[str]] = None,
+    denylist: Optional[List[str]] = None,
+    index_unchanged: bool = False,
+    check_interval_hours: int = 24,
+) -> List[str]:
+    safe_mkdir(dest_root)
+
+    state = load_state(state_file)
+
+    allowset = set(allowlist or [])
+    denyset = set(denylist or [])
+
+    synced_dirs: List[str] = []
+    seen = 0
+    synced = 0
+    offset = 0
+
+    while seen < max_modules_seen and synced < max_modules_synced:
+        page = forge_list_modules(api_base, limit_per_page, offset)
+        results = page.get("results") or []
+        if not results:
+            break
+
+        for item in results:
+            if seen >= max_modules_seen or synced >= max_modules_synced:
+                break
+
+            slug = item.get("slug")
+            if not slug:
+                continue
+            seen += 1
+
+            if allowset and slug not in allowset:
+                continue
+            if slug in denyset:
+                continue
+            if only_owner and not slug.startswith(f"{only_owner}-"):
+                continue
+
+            prev = get_state_entry(state, slug)
+            if prev and check_interval_hours > 0:
+                _, _, last_checked = prev
+                if last_checked:
+                    age = int(time.time()) - int(last_checked)
+                    if age < check_interval_hours * 3600:
+                        continue
+
+            try:
+                mod = forge_get_module(api_base, slug)
+            except Exception as e:
+                print(f"[forge] ERROR fetching {slug}: {e}")
+                time.sleep(request_delay_sec)
+                continue
+
+            current = mod.get("current_release") or {}
+            version = (current.get("version") or "").strip() or "unknown"
+            metadata = current.get("metadata") or {}
+            repo_url = (metadata.get("source") or "").strip()
+            file_uri = (current.get("file_uri") or "").strip()
+
+            use_git = is_probable_git_repo(repo_url)
+
+            if only_with_repo and not use_git:
+                upsert_state_entry(state, slug, version, "tar" if file_uri else "unknown")
+                save_state(state_file, state)
+                time.sleep(request_delay_sec)
+                continue
+
+            prev = get_state_entry(state, slug)
+            if prev and prev[0] == version:
+                upsert_state_entry(state, slug, version, prev[1] or ("git" if use_git else "tar"))
+                save_state(state_file, state)
+
+                if index_unchanged:
+                    _, _, base_dir = slug_to_paths(dest_root, slug)
+                    if use_git:
+                        repo_dir = os.path.join(base_dir, "repo")
+                        if os.path.isdir(repo_dir):
+                            synced_dirs.append(repo_dir)
+                    else:
+                        rel_dir = os.path.join(base_dir, "releases", version)
+                        if os.path.isdir(rel_dir):
+                            synced_dirs.append(rel_dir)
+
+                time.sleep(request_delay_sec)
+                continue
+
+            _, _, base_dir = slug_to_paths(dest_root, slug)
+
+            try:
+                if use_git:
+                    repo_dir = os.path.join(base_dir, "repo")
+                    git_sync(repo_url, repo_dir)
+                    upsert_state_entry(state, slug, version, "git")
+                    save_state(state_file, state)
+                    synced_dirs.append(repo_dir)
+                else:
+                    if not file_uri:
+                        upsert_state_entry(state, slug, version, "unknown")
+                        save_state(state_file, state)
+                        time.sleep(request_delay_sec)
+                        continue
+
+                    dl_dir = os.path.join(base_dir, "downloads")
+                    safe_mkdir(dl_dir)
+                    tgz_path = os.path.join(dl_dir, f"{slug}-{version}.tar.gz")
+                    forge_download_file(api_base, file_uri, tgz_path)
+
+                    rel_dir = os.path.join(base_dir, "releases", version)
+                    safe_extract_tgz(tgz_path, rel_dir)
+
+                    upsert_state_entry(state, slug, version, "tar")
+                    save_state(state_file, state)
+                    synced_dirs.append(rel_dir)
+
+                synced += 1
+                time.sleep(download_delay_sec)
+
+            except Exception as e:
+                print(f"[forge] ERROR syncing {slug}: {e}")
+                time.sleep(request_delay_sec)
+
+        offset += limit_per_page
+        time.sleep(request_delay_sec)
+
+    # dedupe
+    uniq: List[str] = []
+    s = set()
+    for d in synced_dirs:
+        if d not in s:
+            uniq.append(d)
+            s.add(d)
+
+    print(f"[forge] run summary: seen={seen}, synced={synced}, returned_dirs={len(uniq)}")
+    return uniq
+
+
+========================================
+FILE: requirements.txt
+========================================
+requests>=2.31.0
+numpy>=1.26.0
+PyYAML>=6.0.1
+fastapi>=0.110.0
+uvicorn>=0.27.0
+qdrant-client>=1.7.0
+
+========================================
+FILE: raglib.py
+========================================
+import hashlib
+import os
+import fnmatch
+import subprocess
+import uuid
+from typing import Iterator, List, Optional
+
+import requests
+
+
+# ============================================================
+# Text / file utilities (used by ingest.py)
+# ============================================================
+
+def load_text_file(path: str) -> str:
+    """Read a text file as UTF-8 (with replacement)."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    return raw.decode("utf-8", errors="replace")
+
+
+def sha256_str(s: str) -> str:
+    """Stable hash for string content."""
+    return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()
+
+
+sha256_text = sha256_str
+
+
+def uuid5_str(s: str, namespace: uuid.UUID = uuid.NAMESPACE_URL) -> str:
+    """Deterministic UUID (v5) for a given string."""
+    return str(uuid.uuid5(namespace, s))
+
+
+def _expand_brace_glob(glob_pattern: str) -> List[str]:
+    if "{" in glob_pattern and "}" in glob_pattern:
+        pre = glob_pattern.split("{", 1)[0]
+        rest = glob_pattern.split("{", 1)[1]
+        inner, post = rest.split("}", 1)
+        alts = [x.strip() for x in inner.split(",")]
+        return [pre + a + post for a in alts]
+    return [glob_pattern]
+
+
+def iter_files(root: str, glob_pattern: str) -> Iterator[str]:
+    patterns = _expand_brace_glob(glob_pattern)
+
+    SKIP_DIRS = {
+        ".git", ".svn", ".hg", ".idea", ".vscode", "__pycache__", ".venv",
+        "vendor", "node_modules",
+    }
+
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+
+        for fn in files:
+            if fn.startswith("."):
+                continue
+            full = os.path.join(base, fn)
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            for pat in patterns:
+                if fnmatch.fnmatch(rel, pat.replace(os.sep, "/")):
+                    yield full
+                    break
+
+
+def list_files_from_dir(root: str, glob_pattern: str) -> List[str]:
+    return sorted(iter_files(root, glob_pattern))
+
+
+def list_files_multi_glob(root: str, glob_patterns: List[str]) -> List[str]:
+    seen = set()
+    for pat in glob_patterns:
+        for p in iter_files(root, pat):
+            seen.add(p)
+    return sorted(seen)
+
+
+def chunk_text(
+    text: str,
+    chunk_size: int,
+    chunk_overlap: int = 0,
+    *,
+    overlap: Optional[int] = None,
+) -> List[str]:
+    if overlap is not None:
+        chunk_overlap = overlap
+
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+        raise ValueError("overlap must be >=0 and < chunk_size")
+
+    chunks: List[str] = []
+    step = chunk_size - chunk_overlap
+    i = 0
+    n = len(text)
+
+    while i < n:
+        part = text[i:i + chunk_size]
+        if part.strip():
+            chunks.append(part)
+        i += step
+
+    return chunks
+
+
+# ============================================================
+# Git utilities (used by ingest.py)
+# ============================================================
+
+def git_sync(repo_url: str, dest: str, depth: int = 1) -> None:
+    if not os.path.exists(dest):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        cmd = ["git", "clone", "--depth", str(depth), repo_url, dest]
+    else:
+        cmd = ["git", "-C", dest, "pull", "--ff-only"]
+
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git_sync failed for {repo_url}\n"
+            f"CMD: {' '.join(cmd)}\n"
+            f"STDOUT:\n{proc.stdout}\n"
+            f"STDERR:\n{proc.stderr}"
+        )
+
+
+# ============================================================
+# Ollama client (non-stream only)
+# ============================================================
+
+class OllamaClient:
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+
+    def embed(self, model: str, text: str) -> List[float]:
+        url = f"{self.base_url}/api/embeddings"
+        payload = {"model": model, "prompt": text}
+        resp = requests.post(url, json=payload, timeout=600)
+        resp.raise_for_status()
+        return resp.json()["embedding"]
+
+    def chat(
+        self,
+        model: str,
+        messages: list[dict],
+        *,
+        temperature: float | None = None,
+        stop: list[str] | None = None,
+        timeout_sec: int = 1800,
+        **_ignored,
+    ) -> str:
+        """
+        Non-streaming chat. Predictable: request completes and returns one JSON response.
+        No num_predict (no client-side hard stop).
+        """
+        url = f"{self.base_url}/api/chat"
+        payload: dict = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+        }
+
+        options = {}
+        if temperature is not None:
+            options["temperature"] = temperature
+        if stop:
+            options["stop"] = stop
+        if options:
+            payload["options"] = options
+
+        resp = requests.post(url, json=payload, timeout=(10, int(timeout_sec)))
+        resp.raise_for_status()
+        return resp.json()["message"]["content"]
+
+

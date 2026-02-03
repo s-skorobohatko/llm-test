@@ -30,3 +30,6 @@ NEW:
 END DIFF
 
 - Keep changes minimal unless REFERENCE_CONTEXT strongly supports a larger refactor.
+
+Finish by printing this on its own line EXACTLY:
+<<<END>>>

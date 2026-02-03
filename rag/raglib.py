@@ -152,22 +152,19 @@ class OllamaClient:
         model: str,
         messages: list[dict],
         *,
+        stream: bool = False,
         temperature: float | None = None,
         stop: list[str] | None = None,
-        timeout_sec: int = 1800,
+        stream_print: bool = False,
+        timeout_sec: int = 7200,            # total wall-clock max
+        first_token_timeout_sec: int = 900, # max wait for first token
+        idle_timeout_sec: int = 120,        # max seconds with no bytes (prevents “stuck”)
         **_ignored,
-    ) -> str:
-        """
-        Non-streaming chat. Predictable: request completes and returns one JSON response.
-        No num_predict (no client-side hard stop).
-        """
+    ):
         url = f"{self.base_url}/api/chat"
-        payload: dict = {
-            "model": model,
-            "messages": messages,
-            "stream": False,
-        }
+        payload = {"model": model, "messages": messages, "stream": stream}
 
+        # IMPORTANT: no num_predict here
         options = {}
         if temperature is not None:
             options["temperature"] = temperature
@@ -176,6 +173,90 @@ class OllamaClient:
         if options:
             payload["options"] = options
 
-        resp = requests.post(url, json=payload, timeout=(10, int(timeout_sec)))
-        resp.raise_for_status()
-        return resp.json()["message"]["content"]
+        connect_timeout = 10
+
+        # Key trick: make read timeout short so we can treat ReadTimeout as “idle”
+        read_timeout = int(max(10, idle_timeout_sec))
+
+        def _non_stream() -> str:
+            p = dict(payload)
+            p["stream"] = False
+            resp = requests.post(url, json=p, timeout=(connect_timeout, int(timeout_sec)))
+            resp.raise_for_status()
+            return resp.json()["message"]["content"]
+
+        if not stream:
+            return _non_stream()
+
+        out_parts: list[str] = []
+        got_any = False
+        start = time.time()
+        stop_markers = stop or []
+
+        try:
+            with requests.post(url, json=payload, stream=True, timeout=(connect_timeout, read_timeout)) as resp:
+                resp.raise_for_status()
+
+                for line in resp.iter_lines():
+                    now = time.time()
+
+                    # Total wall clock guard (not token-based)
+                    if (now - start) > timeout_sec:
+                        break
+
+                    if not got_any and (now - start) > first_token_timeout_sec:
+                        # model never started — fall back once
+                        text = _non_stream()
+                        if stream_print:
+                            print(text, end="", flush=True)
+                        return text
+
+                    if not line:
+                        continue
+
+                    data = json.loads(line.decode("utf-8"))
+                    if data.get("done") is True:
+                        break
+
+                    token = (data.get("message") or {}).get("content", "")
+                    if not token:
+                        continue
+
+                    got_any = True
+
+                    # IMPORTANT: always buffer, even if printing
+                    out_parts.append(token)
+                    if stream_print:
+                        print(token, end="", flush=True)
+
+                    # ---- Client-side stop (the key fix) ----
+                    if stop_markers:
+                        cur = "".join(out_parts)
+                        for m in stop_markers:
+                            if m and m in cur:
+                                trimmed = cur.split(m, 1)[0].rstrip()
+                                if stream_print:
+                                    print("\n", flush=True)
+                                return trimmed
+
+        except requests.exceptions.ReadTimeout:
+            # No bytes within idle_timeout_sec → return partial output instead of hanging
+            cur = "".join(out_parts).rstrip()
+            if stream_print:
+                print("\n", flush=True)
+            if cur:
+                # If marker was produced but not caught (rare), trim anyway
+                for m in stop_markers:
+                    if m and m in cur:
+                        cur = cur.split(m, 1)[0].rstrip()
+                        break
+                return cur
+            return _non_stream()
+
+        final = "".join(out_parts).rstrip()
+        # final safety trim
+        for m in stop_markers:
+            if m and m in final:
+                final = final.split(m, 1)[0].rstrip()
+                break
+        return final
