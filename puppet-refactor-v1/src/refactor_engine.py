@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Set, Tuple
+import time
 
+from src.logger import Logger
 from src.module_scan import scan_module, render_module_context
 from src.ollama_client import OllamaClient
 from src.prompts import COMMON, DIFF_PROMPT, PLAN_PROMPT, SYSTEM
@@ -40,13 +42,6 @@ def filter_diff_blocks(
     existing_files: Set[str],
     allow_new_files: Set[str],
 ) -> Tuple[str, List[str]]:
-    """
-    Keep diff blocks for:
-      - files that exist
-      - NEW FILE blocks only if allow_new_files contains that path
-
-    Returns (filtered_diff, dropped_paths)
-    """
     lines = diff_text.splitlines()
     kept: List[str] = []
     dropped: List[str] = []
@@ -59,7 +54,6 @@ def filter_diff_blocks(
             is_new = "(NEW FILE)" in header
             path = header.replace("(NEW FILE)", "").strip()
 
-            # capture the entire block until END DIFF (inclusive)
             block = [line]
             i += 1
             while i < len(lines):
@@ -77,7 +71,6 @@ def filter_diff_blocks(
                 dropped.append(path)
             continue
 
-        # ignore any stray non-diff text
         i += 1
 
     filtered = "\n".join(kept).strip()
@@ -86,7 +79,64 @@ def filter_diff_blocks(
     return filtered, dropped
 
 
-def refactor_module(module_path: str, task: str, *, cfg_path: str = "config.yaml") -> RefactorOutput:
+def _looks_complete(diff_text: str) -> bool:
+    t = diff_text.strip()
+    if not t:
+        return True
+    if "DIFF FILE:" not in t:
+        return True
+    return t.endswith("END DIFF")
+
+
+def _chat_with_continuations(
+    ollama: OllamaClient,
+    *,
+    log: Logger,
+    model: str,
+    system: str,
+    user_prompt: str,
+    num_ctx: int,
+    num_predict: int,
+    timeout_sec: int,
+    max_rounds: int = 6,
+) -> str:
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user_prompt}]
+    out_parts: List[str] = []
+
+    for r in range(1, max_rounds + 1):
+        log.phase("diff", f"round {r}/{max_rounds} (num_predict={num_predict}, num_ctx={num_ctx})")
+        t0 = time.time()
+        chunk = ollama.chat(
+            model=model,
+            messages=messages,
+            num_ctx=num_ctx,
+            num_predict=num_predict,
+            temperature=0.1,
+            timeout_sec=timeout_sec,
+        ).strip()
+        dt = time.time() - t0
+        log.metric("diff_round_sec", f"{dt:.1f}")
+        log.metric("diff_round_chars", len(chunk))
+
+        if chunk:
+            out_parts.append(chunk)
+
+        merged = "\n".join(out_parts).strip()
+        if _looks_complete(merged):
+            log.phase("diff", "complete")
+            return merged
+
+        messages.append({"role": "assistant", "content": chunk})
+        messages.append({"role": "user", "content": "CONTINUE. Output the remaining DIFF blocks only. Do not repeat."})
+
+    log.phase("diff", "max rounds reached (may be incomplete)")
+    return "\n".join(out_parts).strip()
+
+
+def refactor_module(module_path: str, task: str, *, cfg_path: str = "config.yaml", log_enabled: bool = False) -> RefactorOutput:
+    log = Logger(enabled=log_enabled)
+
+    t_all = time.time()
     cfg = load_cfg(cfg_path)
 
     ollama = OllamaClient(cfg["ollama_url"])
@@ -95,24 +145,36 @@ def refactor_module(module_path: str, task: str, *, cfg_path: str = "config.yaml
     limits = cfg.get("limits") or {}
     num_ctx = int(limits.get("num_ctx", 8192))
     np_plan = int(limits.get("num_predict_plan", 500))
-    np_diff = int(limits.get("num_predict_diff", 1100))
+    np_diff = int(limits.get("num_predict_diff", 2200))
     max_blob = int(limits.get("max_files_blob_chars", 60000))
+    retrieve_max = int(limits.get("retrieve_max_chars", 9000))
+    diff_max_rounds = int(limits.get("diff_max_rounds", 8))
 
     policy = cfg.get("policy") or {}
     allow_new_files = set(policy.get("allow_new_files") or [])
 
-    # Scan module
+    # Scan
+    log.phase("scan", module_path)
+    t0 = time.time()
     ctx = scan_module(
         module_path,
         max_files=int(limits.get("max_files_read", 200)),
         max_file_bytes=int(limits.get("max_file_bytes", 2_000_000)),
     )
     module_ctx = render_module_context(ctx, max_blob_chars=max_blob)
+    log.metric("scan_sec", f"{time.time()-t0:.1f}")
+    log.metric("files", len(ctx.files))
+    log.metric("module_ctx_chars", len(module_ctx))
 
     # Retrieval
+    log.phase("retrieve")
+    t1 = time.time()
     retrieval_query = f"{task}\n\nModule files:\n" + "\n".join(ctx.files[:120])
     hits = retrieve(retrieval_query, cfg_path=cfg_path)
-    ref_ctx = format_hits(hits, max_chars=int(limits.get("retrieve_max_chars", 9000))) or "(none)"
+    ref_ctx = format_hits(hits, max_chars=retrieve_max) or "(none)"
+    log.metric("retrieve_sec", f"{time.time()-t1:.1f}")
+    log.metric("retrieve_hits", len(hits))
+    log.metric("ref_ctx_chars", len(ref_ctx))
 
     common = COMMON.format(
         module_path=module_path,
@@ -121,7 +183,9 @@ def refactor_module(module_path: str, task: str, *, cfg_path: str = "config.yaml
         allow_new_files=", ".join(sorted(allow_new_files)) if allow_new_files else "(none)",
     )
 
-    # Pass 1: Plan
+    # Plan
+    log.phase("plan")
+    t2 = time.time()
     plan_prompt = PLAN_PROMPT.format(common=common, task=task)
     plan = ollama.chat(
         model=model,
@@ -132,31 +196,37 @@ def refactor_module(module_path: str, task: str, *, cfg_path: str = "config.yaml
         timeout_sec=1800,
         stop=["DIFF FILE:", "END DIFF"],
     ).strip()
+    log.metric("plan_sec", f"{time.time()-t2:.1f}")
+    log.metric("plan_chars", len(plan))
 
-    # Pass 2: Diff
+    # Diff (continuations)
     diff_prompt = DIFF_PROMPT.format(common=common, task=task, plan=plan)
-    diff_raw = ollama.chat(
+    diff_raw = _chat_with_continuations(
+        ollama,
+        log=log,
         model=model,
-        messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": diff_prompt}],
+        system=SYSTEM,
+        user_prompt=diff_prompt,
         num_ctx=num_ctx,
         num_predict=np_diff,
-        temperature=0.1,
         timeout_sec=1800,
-    ).strip()
+        max_rounds=diff_max_rounds,
+    )
 
-    # ✅ Never crash: filter invalid blocks instead
+    # Filter blocks (never crash)
+    log.phase("filter")
     existing = set(ctx.files)
     diff, dropped = filter_diff_blocks(
         diff_raw,
         existing_files=existing,
         allow_new_files=allow_new_files,
     )
+    log.metric("dropped_blocks", len(dropped))
 
     report = []
     report.append("# Puppet Refactor v1 Report\n")
     report.append(f"## Module\n`{module_path}`\n")
     report.append("## Task\n" + task + "\n")
-    report.append("## Retrieval\n```\n" + ref_ctx + "\n```\n")
     report.append("## Plan\n" + plan + "\n")
     if dropped:
         report.append("## Dropped diffs (not allowed / non-existent)\n")
@@ -165,4 +235,5 @@ def refactor_module(module_path: str, task: str, *, cfg_path: str = "config.yaml
         report.append("")
     report.append("## Diff\n" + (diff or "(no allowed diffs produced)") + "\n")
 
+    log.metric("total_sec", f"{time.time()-t_all:.1f}")
     return RefactorOutput(plan=plan, diff=diff, report_md="\n".join(report), dropped_new_files=dropped)

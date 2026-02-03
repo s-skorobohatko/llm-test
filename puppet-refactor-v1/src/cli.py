@@ -11,15 +11,11 @@ def main() -> None:
     ap.add_argument("--module", required=True, help="Path to module root")
     ap.add_argument("--task", required=True, help="Refactor task")
     ap.add_argument("--config", default="config.yaml", help="Path to config.yaml")
-    ap.add_argument(
-        "--mode",
-        choices=["diff", "plan", "report"],
-        default="diff",
-        help="Output mode: diff (default), plan, or full report",
-    )
+    ap.add_argument("--mode", choices=["diff", "plan", "report"], default="diff")
+    ap.add_argument("--log", action="store_true", help="Print progress logs to stderr")
     args = ap.parse_args()
 
-    res = refactor_module(args.module, args.task, cfg_path=args.config)
+    res = refactor_module(args.module, args.task, cfg_path=args.config, log_enabled=args.log)
 
     if args.mode == "diff":
         print(res.diff)

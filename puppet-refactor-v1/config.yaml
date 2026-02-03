@@ -11,8 +11,9 @@ vector_store:
 
 limits:
   num_ctx: 8192
-  num_predict_plan: 900
-  num_predict_diff: 1400
+  num_predict_plan: 1000
+  num_predict_diff: 3000
+  diff_max_rounds: 8
   retrieve_top_k: 3
   retrieve_max_chars: 18000
   max_files_read: 200

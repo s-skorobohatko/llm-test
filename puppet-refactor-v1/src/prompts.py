@@ -50,6 +50,7 @@ Rules:
 No other text.
 """
 
+# NEW: "NEW CONTENT ONLY" format (no OLD blocks at all)
 DIFF_PROMPT = """{common}
 
 TASK:
@@ -59,24 +60,23 @@ PLAN:
 {plan}
 
 OUTPUT:
-Return ONLY diffs for changed files, using EXACT format:
+Return ONLY changed files, using EXACT format:
 
 DIFF FILE: <relative/path>
 --------------------------------
-OLD:
-<only the relevant original lines>
-
 NEW:
-<the modified lines>
+<full updated file content>
 --------------------------------
 END DIFF
 
 Rules:
 - One DIFF FILE block per changed file.
 - Do NOT include unchanged files.
-- Do NOT include any explanations or headings outside DIFF blocks.
+- Do NOT include OLD content anywhere.
+- Do NOT include explanations or headings outside DIFF blocks.
 - Use only relative paths from MODULE_FILES.
 - If (and only if) you create a file from ALLOW_NEW_FILES, write:
   DIFF FILE: <relative/path> (NEW FILE)
   ...
+- If your output is too long, stop ONLY after completing an END DIFF, then wait for a "CONTINUE" request.
 """
