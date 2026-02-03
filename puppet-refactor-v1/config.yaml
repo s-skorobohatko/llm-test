@@ -38,7 +38,7 @@ sources:
     dest: "./sources/vendor/wikimedia/puppet-guidelines"
     glob: "**/*.md"
 
-  - name: "internal_gold_standards"
-    type: "dir"
-    path: "/opt/puppet/gold_modules"
-    glob: "**/*.pp"
+  # - name: "internal_gold_standards"
+  #   type: "dir"
+  #   path: "/opt/puppet/gold_modules"
+  #   glob: "**/*.pp"
