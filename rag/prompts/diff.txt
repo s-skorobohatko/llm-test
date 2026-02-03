@@ -31,5 +31,8 @@ END DIFF
 
 - Keep changes minimal unless REFERENCE_CONTEXT strongly supports a larger refactor.
 
-Finish by printing this on its own line:
-END OF ANSWER
+IMPORTANT FORMATTING:
+- Output plain text only (no markdown fences like ```).
+
+Finish by printing this on its own line EXACTLY:
+<<<END>>>

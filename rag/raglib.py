@@ -192,16 +192,13 @@ class OllamaClient:
         temperature: float | None = None,
         stop: list[str] | None = None,
         stream_print: bool = False,
-        timeout_sec: int = 7200,
-        first_token_timeout_sec: int = 900,
+        timeout_sec: int = 7200,              # max total time you allow (kept)
+        first_token_timeout_sec: int = 900,   # max wait for first token
+        idle_timeout_sec: int = 120,          # NEW: max seconds without receiving bytes
         **_ignored,
     ):
         url = f"{self.base_url}/api/chat"
-        payload = {
-            "model": model,
-            "messages": messages,
-            "stream": stream,
-        }
+        payload = {"model": model, "messages": messages, "stream": stream}
 
         # IMPORTANT: no num_predict here
         options = {}
@@ -213,12 +210,15 @@ class OllamaClient:
             payload["options"] = options
 
         connect_timeout = 10
-        read_timeout = int(timeout_sec)
+
+        # IMPORTANT: use a *short* read timeout so we can detect "idle" via ReadTimeout
+        # We handle ReadTimeout ourselves below.
+        read_timeout = int(min(idle_timeout_sec, max(10, idle_timeout_sec)))
 
         def _non_stream() -> str:
             p = dict(payload)
             p["stream"] = False
-            resp = requests.post(url, json=p, timeout=(connect_timeout, read_timeout))
+            resp = requests.post(url, json=p, timeout=(connect_timeout, int(timeout_sec)))
             resp.raise_for_status()
             return resp.json()["message"]["content"]
 
@@ -228,6 +228,8 @@ class OllamaClient:
         out_parts: list[str] = []
         got_any_token = False
         start_time = time.time()
+        last_byte_time = start_time
+        stop_markers = stop or []
 
         try:
             with requests.post(url, json=payload, stream=True, timeout=(connect_timeout, read_timeout)) as resp:
@@ -236,8 +238,12 @@ class OllamaClient:
                 for line in resp.iter_lines():
                     now = time.time()
 
+                    # total runtime hard guard (not token-based)
+                    if (now - start_time) > timeout_sec:
+                        break
+
                     if not got_any_token and (now - start_time) > first_token_timeout_sec:
-                        # fallback to non-stream if no tokens
+                        # If model never starts, fallback to non-stream once
                         text = _non_stream()
                         if stream_print:
                             print(text, end="", flush=True)
@@ -245,6 +251,8 @@ class OllamaClient:
 
                     if not line:
                         continue
+
+                    last_byte_time = now
 
                     data = json.loads(line.decode("utf-8"))
                     if data.get("done") is True:
@@ -257,10 +265,29 @@ class OllamaClient:
 
                     got_any_token = True
                     out_parts.append(token)
+
                     if stream_print:
                         print(token, end="", flush=True)
 
+                    # CLIENT-SIDE STOP: exit as soon as marker appears
+                    if stop_markers:
+                        current = "".join(out_parts)
+                        for m in stop_markers:
+                            if m and m in current:
+                                trimmed = current.split(m, 1)[0].rstrip()
+                                if stream_print:
+                                    print("\n", flush=True)
+                                return trimmed
+
         except requests.exceptions.ReadTimeout:
+            # No bytes received within idle_timeout_sec
+            current = "".join(out_parts)
+            if got_any_token:
+                # Return partial output; don't re-run non-stream
+                if stream_print:
+                    print("\n", flush=True)
+                return current
+            # If nothing received at all, fallback
             text = _non_stream()
             if stream_print:
                 print(text, end="", flush=True)
