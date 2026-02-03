@@ -20,6 +20,11 @@ limits:
   max_files_blob_chars: 140000
   max_embed_chars: 6000
 
+policy:
+  allow_new_files:
+    - "README.md"
+    - "metadata.json"
+
 ingestion:
   batch_size: 32
   chunk_strategy: "semantic"     # semantic | naive
