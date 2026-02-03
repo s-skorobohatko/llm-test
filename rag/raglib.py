@@ -1,11 +1,9 @@
 import hashlib
-import json
 import os
 import fnmatch
 import subprocess
 import uuid
 from typing import Iterator, List, Optional
-import time 
 
 import requests
 
@@ -26,23 +24,15 @@ def sha256_str(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()
 
 
-# Backward-compatible alias
 sha256_text = sha256_str
 
 
 def uuid5_str(s: str, namespace: uuid.UUID = uuid.NAMESPACE_URL) -> str:
-    """
-    Deterministic UUID (v5) for a given string.
-    Qdrant accepts UUID strings as point IDs.
-    """
+    """Deterministic UUID (v5) for a given string."""
     return str(uuid.uuid5(namespace, s))
 
 
 def _expand_brace_glob(glob_pattern: str) -> List[str]:
-    """
-    Expand brace sets like **/*.{pp,epp,md} into multiple patterns.
-    If no braces, returns [glob_pattern].
-    """
     if "{" in glob_pattern and "}" in glob_pattern:
         pre = glob_pattern.split("{", 1)[0]
         rest = glob_pattern.split("{", 1)[1]
@@ -53,14 +43,6 @@ def _expand_brace_glob(glob_pattern: str) -> List[str]:
 
 
 def iter_files(root: str, glob_pattern: str) -> Iterator[str]:
-    """
-    Yield full file paths under root matching a glob.
-    Supports ** recursion and brace sets.
-
-    Always skips:
-      - .git/ and other junk dirs
-      - hidden dirs and hidden files
-    """
     patterns = _expand_brace_glob(glob_pattern)
 
     SKIP_DIRS = {
@@ -69,7 +51,6 @@ def iter_files(root: str, glob_pattern: str) -> Iterator[str]:
     }
 
     for base, dirs, files in os.walk(root):
-        # prune dirs in-place (important)
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
 
         for fn in files:
@@ -84,12 +65,10 @@ def iter_files(root: str, glob_pattern: str) -> Iterator[str]:
 
 
 def list_files_from_dir(root: str, glob_pattern: str) -> List[str]:
-    """ingest.py expects this name."""
     return sorted(iter_files(root, glob_pattern))
 
 
 def list_files_multi_glob(root: str, glob_patterns: List[str]) -> List[str]:
-    """Return sorted, deduplicated list of files matching ANY glob in list."""
     seen = set()
     for pat in glob_patterns:
         for p in iter_files(root, pat):
@@ -104,13 +83,6 @@ def chunk_text(
     *,
     overlap: Optional[int] = None,
 ) -> List[str]:
-    """
-    Chunk text by characters with overlap.
-
-    Backward compatible:
-      - chunk_text(text, chunk_size, overlap=200)
-      - chunk_text(text, chunk_size, chunk_overlap=200)
-    """
     if overlap is not None:
         chunk_overlap = overlap
 
@@ -138,12 +110,6 @@ def chunk_text(
 # ============================================================
 
 def git_sync(repo_url: str, dest: str, depth: int = 1) -> None:
-    """
-    Clone or fast-forward pull a git repository.
-
-    - If dest does not exist -> git clone --depth <depth>
-    - If dest exists -> git pull --ff-only
-    """
     if not os.path.exists(dest):
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         cmd = ["git", "clone", "--depth", str(depth), repo_url, dest]
@@ -167,14 +133,13 @@ def git_sync(repo_url: str, dest: str, depth: int = 1) -> None:
 
 
 # ============================================================
-# Ollama client (used by ingest.py / ask.py)
+# Ollama client (non-stream only)
 # ============================================================
 
 class OllamaClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
 
-    # ---------- embeddings ----------
     def embed(self, model: str, text: str) -> List[float]:
         url = f"{self.base_url}/api/embeddings"
         payload = {"model": model, "prompt": text}
@@ -182,25 +147,27 @@ class OllamaClient:
         resp.raise_for_status()
         return resp.json()["embedding"]
 
-    # ---------- chat ----------
     def chat(
         self,
         model: str,
         messages: list[dict],
         *,
-        stream: bool = False,
         temperature: float | None = None,
         stop: list[str] | None = None,
-        stream_print: bool = False,
-        timeout_sec: int = 7200,              # max total time you allow (kept)
-        first_token_timeout_sec: int = 900,   # max wait for first token
-        idle_timeout_sec: int = 120,          # NEW: max seconds without receiving bytes
+        timeout_sec: int = 1800,
         **_ignored,
-    ):
+    ) -> str:
+        """
+        Non-streaming chat. Predictable: request completes and returns one JSON response.
+        No num_predict (no client-side hard stop).
+        """
         url = f"{self.base_url}/api/chat"
-        payload = {"model": model, "messages": messages, "stream": stream}
+        payload: dict = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+        }
 
-        # IMPORTANT: no num_predict here
         options = {}
         if temperature is not None:
             options["temperature"] = temperature
@@ -209,89 +176,6 @@ class OllamaClient:
         if options:
             payload["options"] = options
 
-        connect_timeout = 10
-
-        # IMPORTANT: use a *short* read timeout so we can detect "idle" via ReadTimeout
-        # We handle ReadTimeout ourselves below.
-        read_timeout = int(min(idle_timeout_sec, max(10, idle_timeout_sec)))
-
-        def _non_stream() -> str:
-            p = dict(payload)
-            p["stream"] = False
-            resp = requests.post(url, json=p, timeout=(connect_timeout, int(timeout_sec)))
-            resp.raise_for_status()
-            return resp.json()["message"]["content"]
-
-        if not stream:
-            return _non_stream()
-
-        out_parts: list[str] = []
-        got_any_token = False
-        start_time = time.time()
-        last_byte_time = start_time
-        stop_markers = stop or []
-
-        try:
-            with requests.post(url, json=payload, stream=True, timeout=(connect_timeout, read_timeout)) as resp:
-                resp.raise_for_status()
-
-                for line in resp.iter_lines():
-                    now = time.time()
-
-                    # total runtime hard guard (not token-based)
-                    if (now - start_time) > timeout_sec:
-                        break
-
-                    if not got_any_token and (now - start_time) > first_token_timeout_sec:
-                        # If model never starts, fallback to non-stream once
-                        text = _non_stream()
-                        if stream_print:
-                            print(text, end="", flush=True)
-                        return text
-
-                    if not line:
-                        continue
-
-                    last_byte_time = now
-
-                    data = json.loads(line.decode("utf-8"))
-                    if data.get("done") is True:
-                        break
-
-                    msg = data.get("message") or {}
-                    token = msg.get("content", "")
-                    if not token:
-                        continue
-
-                    got_any_token = True
-                    out_parts.append(token)
-
-                    if stream_print:
-                        print(token, end="", flush=True)
-
-                    # CLIENT-SIDE STOP: exit as soon as marker appears
-                    if stop_markers:
-                        current = "".join(out_parts)
-                        for m in stop_markers:
-                            if m and m in current:
-                                trimmed = current.split(m, 1)[0].rstrip()
-                                if stream_print:
-                                    print("\n", flush=True)
-                                return trimmed
-
-        except requests.exceptions.ReadTimeout:
-            # No bytes received within idle_timeout_sec
-            current = "".join(out_parts)
-            if got_any_token:
-                # Return partial output; don't re-run non-stream
-                if stream_print:
-                    print("\n", flush=True)
-                return current
-            # If nothing received at all, fallback
-            text = _non_stream()
-            if stream_print:
-                print(text, end="", flush=True)
-            return text
-
-        final = "".join(out_parts)
-        return final
+        resp = requests.post(url, json=payload, timeout=(10, int(timeout_sec)))
+        resp.raise_for_status()
+        return resp.json()["message"]["content"]

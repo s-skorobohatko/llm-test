@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-ask.py — RAG (Qdrant + Ollama), module-grounded + reference-guided
-
-Changes:
-- Prompts loaded from separate text files (prompts/common_rules.txt, prompts/plan.txt, prompts/diff.txt)
-- Safe diff formatting (DIFF FILE blocks) to avoid markdown/rendering issues
-- Still requires --scope
-- No num_predict handling anywhere
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -26,10 +16,6 @@ from qdrant_store import QdrantStore
 Hit = Tuple[float, Dict[str, Any]]
 
 
-# ----------------------------
-# Filter builders (QdrantStore)
-# ----------------------------
-
 def must_source(value: str) -> Dict[str, Any]:
     return {"key": "source", "match": {"value": value}}
 
@@ -41,10 +27,6 @@ def must_path_contains(text: str) -> Dict[str, Any]:
 def must_module_root(value: str) -> Dict[str, Any]:
     return {"key": "module_root", "match": {"value": value}}
 
-
-# ----------------------------
-# Utilities
-# ----------------------------
 
 def require_keys(cfg: Dict[str, Any], keys: List[str], where: str) -> None:
     missing = [k for k in keys if k not in cfg or cfg[k] in (None, "")]
@@ -89,7 +71,6 @@ def format_context(items: List[Hit], title: str, limit: Optional[int] = None) ->
 
 
 def clamp_scoped_minsim(min_sim: float) -> float:
-    # When scoped, allow more permissive similarity to avoid missing relevant module chunks.
     return min_sim if min_sim <= 0.10 else 0.06
 
 
@@ -102,48 +83,26 @@ def prompt_path(prompt_dir: str, name: str) -> str:
     return os.path.join(prompt_dir, name)
 
 
-# ----------------------------
-# Main
-# ----------------------------
-
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Ask with RAG (Qdrant + Ollama), module-grounded + reference-guided."
-    )
+    ap = argparse.ArgumentParser(description="Ask with RAG (Qdrant + Ollama), non-streaming.")
     ap.add_argument("question", nargs="?", help="Question to ask (or use stdin if omitted)")
     ap.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    ap.add_argument("--prompt_dir", default=None, help="Directory with prompt templates")
 
-    # Retrieval tuning
     ap.add_argument("--topk", type=int, default=None, help="Top-k for MODULE retrieval (scoped)")
     ap.add_argument("--minsim", type=float, default=None, help="Minimum similarity threshold")
-
-    # Grounding: restrict edits to a real module
     ap.add_argument("--scope", default=None, help="Module root path (module_root). Required.")
 
-    # Reference guidance sources (repeatable)
-    ap.add_argument(
-        "--ref_source",
-        action="append",
-        default=[],
-        help="Reference source name (repeatable). Example: vendor:puppetlabs:best-practices",
-    )
+    ap.add_argument("--ref_source", action="append", default=[], help="Reference source name (repeatable)")
     ap.add_argument("--ref_topk", type=int, default=12, help="Top-k for REFERENCE retrieval (per run)")
 
-    # Diagnostics / output
     ap.add_argument("--show_context", type=int, default=30, help="How many retrieved items to print per section")
     ap.add_argument("--json", action="store_true", help="Output JSON (answer + retrieval + timings)")
 
-    # Quality modes
     ap.add_argument("--two_pass", action="store_true", help="Run plan pass first, then diff pass")
-    ap.add_argument(
-        "--mode",
-        choices=["diff", "plan", "both"],
-        default="diff",
-        help="What to generate: diff | plan | both (default: diff)",
-    )
+    ap.add_argument("--mode", choices=["diff", "plan", "both"], default="diff")
 
-    # Prompt directory
-    ap.add_argument("--prompt_dir", default=None, help="Directory with prompt templates (default: from config or ./prompts)")
+    ap.add_argument("--timeout_sec", type=int, default=1800, help="Timeout per model call (seconds)")
 
     args = ap.parse_args()
     question = read_question(args.question)
@@ -152,17 +111,11 @@ def main() -> None:
         print("ERROR: --scope is required (prevents hallucinated file paths).", file=sys.stderr)
         sys.exit(2)
 
-    # Load config
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
-    require_keys(
-        cfg,
-        ["ollama_url", "embed_model", "chat_model", "qdrant_url", "qdrant_collection"],
-        args.config,
-    )
+    require_keys(cfg, ["ollama_url", "embed_model", "chat_model", "qdrant_url", "qdrant_collection"], args.config)
 
-    # Validate vector_store if present
     if cfg.get("vector_store") and cfg["vector_store"] != "qdrant":
         raise SystemExit("config.yaml vector_store must be 'qdrant' (or omit vector_store)")
 
@@ -179,8 +132,6 @@ def main() -> None:
     ref_sources = args.ref_source[:] if args.ref_source else default_ref_sources
 
     prompt_dir = args.prompt_dir or cfg.get("prompt_dir") or "./prompts"
-
-    # Load prompt templates from files
     common_rules_tpl = load_prompt(prompt_path(prompt_dir, "common_rules.txt"))
     plan_tpl = load_prompt(prompt_path(prompt_dir, "plan.txt"))
     diff_tpl = load_prompt(prompt_path(prompt_dir, "diff.txt"))
@@ -190,12 +141,11 @@ def main() -> None:
 
     t0 = time.time()
 
-    # 1) Embed query
+    # Embed query
     q_vec = client.embed(embed_model, question)
 
-    # 2) MODULE retrieval (authoritative for what exists)
+    # MODULE retrieval
     scoped_min_sim = clamp_scoped_minsim(min_sim)
-
     module_hits = store.search(
         query_vector=q_vec,
         top_k=max(top_k_module, 60),
@@ -210,10 +160,9 @@ def main() -> None:
             must=[must_path_contains(args.scope)],
         )
 
-    # 3) REFERENCE retrieval (authoritative guidance)
+    # REFERENCE retrieval
     ref_hits_all: List[Hit] = []
     per_src = max(4, args.ref_topk // max(1, len(ref_sources)))
-
     for src in ref_sources:
         ref_hits_all.extend(
             store.search(
@@ -223,99 +172,56 @@ def main() -> None:
                 must=[must_source(src)],
             )
         )
-
     ref_hits_all.sort(key=lambda x: x[0], reverse=True)
     ref_hits = ref_hits_all[: args.ref_topk]
 
-    # 4) Diagnostics (unless JSON)
+    # Diagnostics
     if not args.json:
         print("=== Retrieved context (MODULE) ===")
         for i, (score, payload) in enumerate(module_hits[: args.show_context], start=1):
             p = payload.get("relpath") or payload.get("path") or "?"
-            print(
-                f"[{i}] sim={score:.3f} {payload.get('source','?')} "
-                f"{p}#chunk{payload.get('chunk_index','?')}"
-            )
+            print(f"[{i}] sim={score:.3f} {payload.get('source','?')} {p}#chunk{payload.get('chunk_index','?')}")
 
         print("\n=== Retrieved context (REFERENCE) ===")
         for i, (score, payload) in enumerate(ref_hits[: args.show_context], start=1):
-            print(
-                f"[{i}] sim={score:.3f} {payload.get('source','?')} "
-                f"{payload.get('path','?')}#chunk{payload.get('chunk_index','?')}"
-            )
+            print(f"[{i}] sim={score:.3f} {payload.get('source','?')} {payload.get('path','?')}#chunk{payload.get('chunk_index','?')}")
 
-    # 5) Build prompt contexts
+    # Build contexts
     module_ctx = format_context(module_hits, "MODULE_CONTEXT (authoritative; only these files exist):", None)
     ref_ctx = format_context(ref_hits, "REFERENCE_CONTEXT (authoritative Puppet guidance):", None)
 
-    # 6) Render prompts from templates (NO triple quotes in code)
-    common_rules = common_rules_tpl.format(
-        scope=args.scope,
-        ref_ctx=ref_ctx,
-        module_ctx=module_ctx,
-    )
+    # Render prompts from files
+    common_rules = common_rules_tpl.format(scope=args.scope, ref_ctx=ref_ctx, module_ctx=module_ctx)
+    plan_prompt = plan_tpl.format(common_rules=common_rules, question=question)
+    diff_prompt = diff_tpl.format(common_rules=common_rules, question=question)
 
-    plan_prompt = plan_tpl.format(
-        common_rules=common_rules,
-        question=question,
-    )
-
-    diff_prompt = diff_tpl.format(
-        common_rules=common_rules,
-        question=question,
-    )
-
-    # 7) Generate (streaming)
-    if not args.json:
-        print("\n=== Answer (streaming) ===")
-
-    plan_text = ""
-    diff_text = ""
-
-    # ---- Plan pass ----
-    if args.two_pass or args.mode in ("plan", "both"):
-        plan_text = client.chat(
+    def run_model(prompt_text: str) -> str:
+        messages = [
+            {"role": "system", "content": "You are a Puppet expert assistant. Follow the formatting rules exactly."},
+            {"role": "user", "content": prompt_text},
+        ]
+        return client.chat(
             model=chat_model,
-            messages=[{"role": "user", "content": plan_prompt}],
-            stream=True,
-            stream_print=(not args.json),
-            stop=["<<<END>>>"],
-        )
-        if not args.json:
-            print("\n")  # newline after streaming
+            messages=messages,
+            timeout_sec=args.timeout_sec,
+        ).strip()
 
-        if args.mode == "both" and not args.json:
-            print("=== Plan complete; generating diffs ===\n")
+    # Generate
+    plan_text = ""
+    if args.two_pass or args.mode in ("plan", "both"):
+        plan_text = run_model(plan_prompt)
 
-    # ---- Diff pass ----
     if args.mode == "plan":
-        final_answer = plan_text.strip()
+        final_answer = plan_text
     else:
+        diff_prompt2 = diff_prompt
         if args.two_pass and plan_text.strip():
             diff_prompt2 = diff_prompt + "\n\nCONSTRAINT: Follow this plan:\n" + plan_text
-            diff_text = client.chat(
-                model=chat_model,
-                messages=[{"role": "user", "content": diff_prompt2}],
-                stream=True,
-                stream_print=(not args.json),
-                stop=["<<<END>>>"],
-            )
-        else:
-            diff_text = client.chat(
-                model=chat_model,
-                messages=[{"role": "user", "content": diff_prompt}],
-                stream=True,
-                stream_print=(not args.json),
-                stop=["<<<END>>>"],
-            )
-
-        if not args.json:
-            print("\n")
-        final_answer = diff_text.strip()
+        diff_text = run_model(diff_prompt2)
+        final_answer = diff_text
 
     dt = time.time() - t0
 
-    # 8) Output
     result = {
         "answer": final_answer,
         "elapsed_sec": round(dt, 3),
@@ -328,6 +234,7 @@ def main() -> None:
             "ref_sources": ref_sources,
             "ref_topk": int(args.ref_topk),
             "prompt_dir": prompt_dir,
+            "timeout_sec": int(args.timeout_sec),
         },
         "retrieval": {
             "module": [

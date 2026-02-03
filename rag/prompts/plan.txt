@@ -7,9 +7,3 @@ OUTPUT:
 1) FILES TO TOUCH (existing files only; from MODULE_CONTEXT).
 2) CHANGE PLAN (bullet points per file).
 3) REFERENCE JUSTIFICATION mapping key plan items -> REF [n].
-
-IMPORTANT FORMATTING:
-- Output plain text only (no markdown fences like ```).
-
-Finish by printing this on its own line EXACTLY:
-<<<END>>>
