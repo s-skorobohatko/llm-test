@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import os
 import subprocess
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List
 
 import yaml
@@ -37,22 +37,36 @@ def git_sync(url: str, dest: str) -> None:
         subprocess.check_call(["git", "clone", "--depth", "1", url, dest])
 
 
-def iter_files(root: str, pattern: str) -> List[str]:
+def iter_files(root: str, pattern: str | List[str]) -> List[str]:
     """
-    Walk root and return files matching the given glob-like pattern
-    (relative path match via fnmatch).
+    Proper glob semantics (supports **).
+    Also ensures root-level matches when pattern starts with "**/".
+    Accepts glob as string or list of strings.
     """
+    rootp = Path(root).resolve()
+    patterns: List[str]
+
+    if isinstance(pattern, list):
+        patterns = pattern[:]
+    else:
+        patterns = [pattern]
+
     out: List[str] = []
-    root = os.path.abspath(root)
+    seen: set[str] = set()
 
-    for base, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in {".git", ".venv", "__pycache__"}]
+    for pat in patterns:
+        # If pattern is "**/*.md", also try "*.md" so README.md at repo root is included.
+        pats = [pat]
+        if pat.startswith("**/"):
+            pats.append(pat[3:])
 
-        for fn in files:
-            full = os.path.join(base, fn)
-            rel = os.path.relpath(full, root).replace(os.sep, "/")
-            if fnmatch.fnmatch(rel, pattern.replace(os.sep, "/")):
-                out.append(full)
+        for one in pats:
+            for p in rootp.glob(one):
+                if p.is_file():
+                    s = str(p)
+                    if s not in seen:
+                        out.append(s)
+                        seen.add(s)
 
     return sorted(out)
 
@@ -150,8 +164,10 @@ def main() -> None:
     max_bytes = int(cfg["limits"]["max_file_bytes"])
     strategy = (cfg["ingestion"].get("chunk_strategy") or "semantic").strip()
 
-    # Normalize sources (fixes your KeyError: 'type')
+    # Normalize sources (fixes KeyError: 'type' and validates minimal keys)
     sources = [normalize_source(s) for s in cfg.get("sources", [])]
+    if not sources:
+        raise RuntimeError("No sources enabled in config.yaml (sources list is empty).")
 
     jobs: List[Dict[str, Any]] = []
     for src in sources:
@@ -164,8 +180,18 @@ def main() -> None:
             root = src["path"]
 
         glob_pat = src.get("glob", "**/*")
-        for fp in iter_files(root, glob_pat):
+        matched = iter_files(root, glob_pat)
+
+        # Visibility: prevents “upserted=1” surprises
+        print(
+            f"[ingest] source={src['name']} type={stype} root={root} glob={glob_pat} matched_files={len(matched)}",
+            flush=True,
+        )
+
+        for fp in matched:
             jobs.append({"source": src["name"], "root": root, "path": fp})
+
+    print(f"[ingest] total_jobs={len(jobs)}", flush=True)
 
     points: List[qm.PointStruct] = []
     collection_ready = False
@@ -210,7 +236,7 @@ def main() -> None:
         store.upsert(points)
         upserted += len(points)
 
-    print(f"[ingest] done upserted={upserted}")
+    print(f"[ingest] done upserted={upserted}", flush=True)
 
 
 if __name__ == "__main__":
