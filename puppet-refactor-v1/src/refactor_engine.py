@@ -1,13 +1,12 @@
 from __future__ import annotations
-import re
-import yaml
-from dataclasses import dataclass
-from typing import List, Dict
 
-from src.ollama_client import OllamaClient
+from dataclasses import dataclass
+from typing import List
+
 from src.module_scan import scan_module, render_module_context
-from src.retrieval import retrieve, format_hits
-from src.prompts import SYSTEM, COMMON, PLAN_PROMPT, DIFF_PROMPT
+from src.ollama_client import OllamaClient
+from src.prompts import COMMON, DIFF_PROMPT, PLAN_PROMPT, SYSTEM
+from src.retrieval import format_hits, retrieve
 
 
 @dataclass
@@ -17,43 +16,53 @@ class RefactorOutput:
     report_md: str
 
 
-_DIFF_FILE_RE = re.compile(r"(?m)^DIFF FILE:\s+(.+?)\s*$")
+def extract_diff_paths(diff_text: str) -> List[str]:
+    out: List[str] = []
+    for line in diff_text.splitlines():
+        if line.startswith("DIFF FILE:"):
+            p = line[len("DIFF FILE:") :].strip()
+            # allow "(NEW FILE)" suffix in future, strip it
+            p = p.replace("(NEW FILE)", "").strip()
+            out.append(p)
+    return out
 
 
-def load_cfg(path: str = "config.yaml") -> dict:
+def load_cfg(path: str) -> dict:
+    import yaml
+
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
-def extract_diff_paths(diff_text: str) -> List[str]:
-    return [m.group(1).strip() for m in _DIFF_FILE_RE.finditer(diff_text)]
-
-
 def refactor_module(module_path: str, task: str, *, cfg_path: str = "config.yaml") -> RefactorOutput:
     cfg = load_cfg(cfg_path)
+
     ollama = OllamaClient(cfg["ollama_url"])
-
     model = cfg["models"]["chat"]
-    num_ctx = int(cfg["limits"]["num_ctx"])
-    np_plan = int(cfg["limits"]["num_predict_plan"])
-    np_diff = int(cfg["limits"]["num_predict_diff"])
-    ref_max = int(cfg["limits"]["retrieve_max_chars"])
 
-    # 1) scan module (authoritative)
+    limits = cfg.get("limits") or {}
+    num_ctx = int(limits.get("num_ctx", 8192))
+    np_plan = int(limits.get("num_predict_plan", 500))
+    np_diff = int(limits.get("num_predict_diff", 1100))  # slightly higher to avoid truncating diffs
+    max_blob = int(limits.get("max_files_blob_chars", 60000))
+
+    # Scan module (authoritative list + content)
     ctx = scan_module(
         module_path,
-        max_files=int(cfg["limits"]["max_files_read"]),
-        max_file_bytes=int(cfg["limits"]["max_file_bytes"]),
+        max_files=int(limits.get("max_files_read", 200)),
+        max_file_bytes=int(limits.get("max_file_bytes", 2_000_000)),
     )
-    module_ctx = render_module_context(ctx, max_blob_chars=int(cfg["limits"]["max_files_blob_chars"]))
+    module_ctx = render_module_context(ctx, max_blob_chars=max_blob)
 
-    # 2) retrieval (task + module file list helps)
-    retrieval_query = f"Task:\n{task}\n\nModule files:\n" + "\n".join(ctx.files[:80])
+    # Retrieval
+    retrieval_query = f"{task}\n\nModule files:\n" + "\n".join(ctx.files[:120])
     hits = retrieve(retrieval_query, cfg_path=cfg_path)
-    ref_ctx = format_hits(hits, max_chars=ref_max) or "(none)"
+    ref_ctx = format_hits(hits, max_chars=int(limits.get("retrieve_max_chars", 9000))) or "(none)"
 
-    # 3) plan pass
-    plan_prompt = PLAN_PROMPT.format(common=COMMON, task=task, ref_ctx=ref_ctx, module_ctx=module_ctx)
+    common = COMMON.format(module_path=module_path, ref_ctx=ref_ctx, module_ctx=module_ctx)
+
+    # Pass 1: Plan (short)
+    plan_prompt = PLAN_PROMPT.format(common=common, task=task)
     plan = ollama.chat(
         model=model,
         messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": plan_prompt}],
@@ -61,10 +70,11 @@ def refactor_module(module_path: str, task: str, *, cfg_path: str = "config.yaml
         num_predict=np_plan,
         temperature=0.1,
         timeout_sec=1800,
+        stop=["DIFF FILE:", "END DIFF"],
     ).strip()
 
-    # 4) diff pass
-    diff_prompt = DIFF_PROMPT.format(common=COMMON, task=task, plan=plan, ref_ctx=ref_ctx, module_ctx=module_ctx)
+    # Pass 2: Diff (diff-only)
+    diff_prompt = DIFF_PROMPT.format(common=common, task=task, plan=plan)
     diff = ollama.chat(
         model=model,
         messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": diff_prompt}],
@@ -72,9 +82,10 @@ def refactor_module(module_path: str, task: str, *, cfg_path: str = "config.yaml
         num_predict=np_diff,
         temperature=0.1,
         timeout_sec=1800,
+        stop=None,
     ).strip()
 
-    # 5) server-side enforcement: no hallucinated paths
+    # Enforce no hallucinated paths
     allowed = set(ctx.files)
     diff_paths = extract_diff_paths(diff)
     bad = [p for p in diff_paths if p not in allowed]

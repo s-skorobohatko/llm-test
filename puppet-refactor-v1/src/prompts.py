@@ -1,26 +1,28 @@
-SYSTEM = (
-    "You are a senior Puppet 8 engineer. "
-    "Follow constraints exactly. Output must be strictly formatted."
-)
+SYSTEM = """You are a senior Puppet engineer (Puppet 8+). You refactor production Puppet modules.
 
-COMMON = """MANDATORY GOOD PRACTICE RULES (Puppet 8):
-- Role/Profile:
-  - Roles only include profiles (no resources in roles).
-  - Profiles use lookup() for data.
-  - Modules remain generic; no site-specific values in components.
-- Data types:
-  - Every class parameter must have Puppet data types (String, Boolean, Integer, Optional[], Stdlib::Port, etc).
-  - Do not use legacy validate_* functions.
-- Idempotency:
-  - exec must include onlyif/unless/creates as appropriate.
-- Formatting:
-  - ensure must be the first attribute in a resource.
-  - align arrows (=>) within a block.
+Hard rules:
+- ONLY modify files that exist in MODULE_FILES (authoritative). Never invent paths.
+- Keep changes minimal unless strongly necessary.
+- Role/Profile pattern:
+  - Module classes remain generic (no node-specific logic).
+  - Profiles use lookup() for site data.
+  - Roles only include profiles (do not manage resources directly).
+- Every class parameter must have a Puppet 8 data type.
+- Idempotency: exec resources must have onlyif/unless/creates as appropriate.
+- Formatting: ensure is the first attribute, align arrows (=>) within a block.
+- Output must follow the requested format exactly.
+"""
 
-HARD CONSTRAINTS:
-- You MUST ONLY reference and modify files listed in MODULE_FILES.
-- You MUST NOT invent file paths.
-- Output ONLY the required format. No extra text.
+COMMON = """You are refactoring only the module located at:
+{module_path}
+
+REFERENCE_CONTEXT is guidance/examples. MODULE_CONTEXT is the source of truth for what files exist.
+
+REFERENCE_CONTEXT:
+{ref_ctx}
+
+MODULE_CONTEXT:
+{module_ctx}
 """
 
 PLAN_PROMPT = """{common}
@@ -28,16 +30,17 @@ PLAN_PROMPT = """{common}
 TASK:
 {task}
 
-REFERENCE_CONTEXT (authoritative guidance):
-{ref_ctx}
+OUTPUT:
+Return ONLY:
 
-MODULE_CONTEXT (authoritative module files and content):
-{module_ctx}
+FILES TO TOUCH:
+- <file>
+- <file>
 
-OUTPUT FORMAT:
-1) FILES TO TOUCH (paths from MODULE_FILES)
-2) PLAN (bullet points per file)
-3) JUSTIFICATION (map plan bullets -> REF [n])
+PLAN:
+- <bullet points per file>
+
+No other text.
 """
 
 DIFF_PROMPT = """{common}
@@ -45,19 +48,13 @@ DIFF_PROMPT = """{common}
 TASK:
 {task}
 
-PLAN (must follow):
+PLAN:
 {plan}
 
-REFERENCE_CONTEXT:
-{ref_ctx}
+OUTPUT:
+Return ONLY diffs for changed files, using EXACT format:
 
-MODULE_CONTEXT:
-{module_ctx}
-
-OUTPUT FORMAT (EXACT):
-For each changed file, output:
-
-DIFF FILE: <path>
+DIFF FILE: <relative/path>
 --------------------------------
 OLD:
 <only the relevant original lines>
@@ -67,8 +64,9 @@ NEW:
 --------------------------------
 END DIFF
 
-RULES:
-- Only files from MODULE_FILES.
-- One DIFF FILE block per file.
+Rules:
+- One DIFF FILE block per changed file.
 - Do NOT include unchanged files.
+- Do NOT include any explanations, headings, or extra text outside DIFF blocks.
+- Use only relative paths from MODULE_FILES.
 """
