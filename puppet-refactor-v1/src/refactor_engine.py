@@ -1,4 +1,3 @@
-# src/refactor_engine.py
 from __future__ import annotations
 
 import time
@@ -28,10 +27,6 @@ def load_cfg(path: str) -> dict:
 
 
 def _looks_complete(diff_text: str) -> bool:
-    """
-    We consider output complete if it ends right after END DIFF.
-    (We instruct the model to stop only after END DIFF.)
-    """
     t = diff_text.strip()
     if not t:
         return True
@@ -41,10 +36,28 @@ def _looks_complete(diff_text: str) -> bool:
 
 
 def _contains_unified_hunks(text: str) -> bool:
-    for line in text.splitlines():
-        if line.startswith("@@ "):
-            return True
-    return False
+    return any(line.startswith("@@ ") for line in text.splitlines())
+
+
+def _parse_plan_file_list(plan_text: str, allowed: Set[str], allow_new: Set[str]) -> List[str]:
+    """
+    Plan is 'one file per line'. Return only valid/allowed paths.
+    """
+    out: List[str] = []
+    for raw in (plan_text or "").splitlines():
+        p = raw.strip().lstrip("-").strip()
+        if not p:
+            continue
+        if p in allowed or p in allow_new:
+            out.append(p)
+    # de-dupe preserving order
+    seen = set()
+    uniq: List[str] = []
+    for p in out:
+        if p not in seen:
+            uniq.append(p)
+            seen.add(p)
+    return uniq
 
 
 def extract_diff_paths(diff_text: str) -> List[str]:
@@ -54,7 +67,14 @@ def extract_diff_paths(diff_text: str) -> List[str]:
             p = line[len("DIFF FILE:") :].strip()
             p = p.replace("(NEW FILE)", "").strip()
             out.append(p)
-    return out
+    # de-dupe preserving order
+    seen = set()
+    uniq: List[str] = []
+    for p in out:
+        if p not in seen:
+            uniq.append(p)
+            seen.add(p)
+    return uniq
 
 
 def filter_diff_blocks(
@@ -63,13 +83,6 @@ def filter_diff_blocks(
     existing_files: Set[str],
     allow_new_files: Set[str],
 ) -> Tuple[str, List[str]]:
-    """
-    Keep DIFF FILE blocks for:
-      - existing files
-      - NEW FILE blocks only if allow_new_files contains that path
-
-    Returns (filtered_diff, dropped_paths)
-    """
     lines = diff_text.splitlines()
     kept: List[str] = []
     dropped: List[str] = []
@@ -82,7 +95,6 @@ def filter_diff_blocks(
             is_new = "(NEW FILE)" in header
             path = header.replace("(NEW FILE)", "").strip()
 
-            # capture block to END DIFF inclusive
             block = [line]
             i += 1
             while i < len(lines):
@@ -100,7 +112,6 @@ def filter_diff_blocks(
                 dropped.append(path)
             continue
 
-        # ignore any stray non-diff text
         i += 1
 
     filtered = "\n".join(kept).strip()
@@ -121,10 +132,6 @@ def _chat_with_continuations(
     timeout_sec: int,
     max_rounds: int,
 ) -> str:
-    """
-    Repeatedly call the model and ask CONTINUE if output appears truncated.
-    Logs each round to avoid "stuck" feeling.
-    """
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user_prompt}]
     out_parts: List[str] = []
 
@@ -152,7 +159,6 @@ def _chat_with_continuations(
             log.phase("diff", "complete")
             return merged
 
-        # Ask to continue from where it stopped
         messages.append({"role": "assistant", "content": chunk})
         messages.append(
             {
@@ -177,9 +183,6 @@ def _repair_diff_format(
     diff_prompt: str,
     bad_output: str,
 ) -> str:
-    """
-    One-shot repair if model returned unified diff hunks (@@) or otherwise wrong format.
-    """
     log.phase("diff", "repairing format (found unified hunks @@)")
     messages = [
         {"role": "system", "content": system},
@@ -217,7 +220,6 @@ def refactor_module(
     t_all = time.time()
     cfg = load_cfg(cfg_path)
 
-    # ----- config -----
     ollama = OllamaClient(cfg["ollama_url"])
     model = cfg["models"]["chat"]
 
@@ -233,7 +235,7 @@ def refactor_module(
     policy = cfg.get("policy") or {}
     allow_new_files = set(policy.get("allow_new_files") or [])
 
-    # ----- scan -----
+    # scan
     log.phase("scan", module_path)
     t0 = time.time()
     ctx = scan_module(
@@ -242,17 +244,21 @@ def refactor_module(
         max_file_bytes=int(limits.get("max_file_bytes", 2_000_000)),
     )
     module_ctx = render_module_context(ctx, max_blob_chars=max_blob)
-    log.metric("scan_sec", f"{time.time()-t0:.1f}")
+    scan_sec = time.time() - t0
+    log.metric("scan_sec", f"{scan_sec:.1f}")
     log.metric("files", len(ctx.files))
     log.metric("module_ctx_chars", len(module_ctx))
 
-    # ----- retrieval -----
+    existing = set(ctx.files)
+
+    # retrieval
     log.phase("retrieve")
     t1 = time.time()
     retrieval_query = f"{task}\n\nModule files:\n" + "\n".join(ctx.files[:160])
     hits = retrieve(retrieval_query, cfg_path=cfg_path)
     ref_ctx = format_hits(hits, max_chars=retrieve_max) or "(none)"
-    log.metric("retrieve_sec", f"{time.time()-t1:.1f}")
+    retrieve_sec = time.time() - t1
+    log.metric("retrieve_sec", f"{retrieve_sec:.1f}")
     log.metric("retrieve_hits", len(hits))
     log.metric("ref_ctx_chars", len(ref_ctx))
 
@@ -263,7 +269,7 @@ def refactor_module(
         allow_new_files=", ".join(sorted(allow_new_files)) if allow_new_files else "(none)",
     )
 
-    # ----- plan (file list only) -----
+    # plan (short: file list only)
     log.phase("plan")
     t2 = time.time()
     plan_prompt = PLAN_PROMPT.format(common=common, task=task)
@@ -274,13 +280,22 @@ def refactor_module(
         num_predict=np_plan,
         temperature=0.1,
         timeout_sec=timeout_sec,
-        stop=["END DIFF", "DIFF FILE:"],  # prevent drifting
+        stop=["END DIFF", "DIFF FILE:"],
     ).strip()
-    log.metric("plan_sec", f"{time.time()-t2:.1f}")
+    plan_sec = time.time() - t2
+    log.metric("plan_sec", f"{plan_sec:.1f}")
     log.metric("plan_chars", len(plan))
 
-    # ----- diff (full NEW file content, continuation loop) -----
-    diff_prompt = DIFF_PROMPT.format(common=common, task=task, plan=plan)
+    planned_files = _parse_plan_file_list(plan, existing, allow_new_files)
+    if log_enabled:
+        log.phase("plan_files", f"{len(planned_files)} selected")
+        for p in planned_files[:25]:
+            log.info(f"plan_file={p}")
+        if len(planned_files) > 25:
+            log.info(f"plan_file=... (+{len(planned_files)-25} more)")
+
+    # diff
+    diff_prompt = DIFF_PROMPT.format(common=common, task=task, plan="\n".join(planned_files))
     diff_raw = _chat_with_continuations(
         ollama,
         log=log,
@@ -293,7 +308,6 @@ def refactor_module(
         max_rounds=diff_max_rounds,
     )
 
-    # Repair if it still produced unified hunks
     if _contains_unified_hunks(diff_raw):
         diff_raw = _repair_diff_format(
             ollama,
@@ -307,23 +321,36 @@ def refactor_module(
             bad_output=diff_raw,
         )
 
-    # ----- filter (never crash) -----
+    # filter + extract produced files
     log.phase("filter")
-    existing = set(ctx.files)
-    diff, dropped = filter_diff_blocks(
-        diff_raw,
-        existing_files=existing,
-        allow_new_files=allow_new_files,
-    )
-    log.metric("dropped_blocks", len(dropped))
+    diff, dropped = filter_diff_blocks(diff_raw, existing_files=existing, allow_new_files=allow_new_files)
+    produced_files = extract_diff_paths(diff)
 
-    # ----- report -----
+    # summary anchors (stderr only)
+    if log_enabled:
+        log.phase("summary")
+        log.metric("planned_files", len(planned_files))
+        log.metric("produced_files", len(produced_files))
+        if dropped:
+            log.metric("dropped_blocks", len(dropped))
+
+        missing = [p for p in planned_files if p not in set(produced_files)]
+        extra = [p for p in produced_files if p not in set(planned_files)]
+
+        if missing:
+            log.info("WARN planned_but_not_produced=" + ", ".join(missing[:15]) + ("" if len(missing) <= 15 else f" (+{len(missing)-15})"))
+        if extra:
+            log.info("WARN produced_not_in_plan=" + ", ".join(extra[:15]) + ("" if len(extra) <= 15 else f" (+{len(extra)-15})"))
+
+        log.metric("total_sec", f"{time.time()-t_all:.1f}")
+
+    # report (optional for --mode report)
     report = []
     report.append("# Puppet Refactor v1 Report\n")
     report.append(f"## Module\n`{module_path}`\n")
     report.append("## Task\n" + task + "\n")
     report.append("## Retrieval\n```\n" + ref_ctx + "\n```\n")
-    report.append("## Files To Touch (plan)\n```\n" + (plan or "(none)") + "\n```\n")
+    report.append("## Planned files\n```\n" + "\n".join(planned_files) + "\n```\n")
     if dropped:
         report.append("## Dropped diffs (not allowed / non-existent)\n")
         for p in dropped:
@@ -331,5 +358,4 @@ def refactor_module(
         report.append("")
     report.append("## Diff\n" + (diff or "(no allowed diffs produced)") + "\n")
 
-    log.metric("total_sec", f"{time.time()-t_all:.1f}")
     return RefactorOutput(plan=plan, diff=diff, report_md="\n".join(report), dropped_new_files=dropped)

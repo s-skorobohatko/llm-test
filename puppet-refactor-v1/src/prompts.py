@@ -38,8 +38,9 @@ OUTPUT:
 Return ONLY a list of files to change (relative paths), one per line.
 
 Rules:
-- Only choose from manifests/*.pp and templates/*.(epp|erb) unless the TASK explicitly requires other files.
-- Choose at least 3 manifests/*.pp if they exist and need typing/cleanup.
+- Only choose from manifests/*.pp and templates/*.(epp|erb) unless TASK explicitly requires others.
+- Prefer manifests/*.pp first.
+- Choose at least 3 manifests/*.pp if they exist.
 - No explanations.
 """
 
@@ -63,7 +64,7 @@ END DIFF
 
 Rules:
 - Output DIFF blocks ONLY for files listed in FILES_TO_TOUCH.
-- Do NOT output @@ hunks or patch markers.
-- Do NOT include explanations outside DIFF blocks.
 - Do NOT include unchanged files.
+- Do NOT include explanations outside DIFF blocks.
+- Do NOT output @@ hunks.
 """
