@@ -18,6 +18,7 @@ limits:
   max_files_read: 200
   max_file_bytes: 2000000
   max_files_blob_chars: 140000
+  max_embed_chars: 6000
 
 ingestion:
   batch_size: 32

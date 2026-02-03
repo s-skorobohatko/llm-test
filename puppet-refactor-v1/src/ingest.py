@@ -105,15 +105,33 @@ def normalize_source(src: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def cap_text_for_embedding(text: str, max_chars: int) -> str:
-    """
-    Keep embedding prompts bounded. This reduces Ollama failures and keeps ingestion fast.
-    (Embeddings don't need the entire file if it's huge.)
-    """
     if max_chars <= 0:
         return text
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n\n[TRUNCATED FOR EMBEDDING]\n"
+
+
+def chunk_markdown(text: str, *, chunk_size: int = 4000, overlap: int = 200) -> List[str]:
+    """
+    Simple, safe chunking for markdown to avoid embedding context overflow.
+    Uses character windows (good enough for v1).
+    """
+    if chunk_size <= 0:
+        return [text]
+    if overlap < 0 or overlap >= chunk_size:
+        overlap = 0
+
+    out: List[str] = []
+    step = chunk_size - overlap
+    i = 0
+    n = len(text)
+    while i < n:
+        part = text[i : i + chunk_size]
+        if part.strip():
+            out.append(part)
+        i += step
+    return out or [text]
 
 
 def main() -> None:
@@ -123,22 +141,25 @@ def main() -> None:
     ollama_url = cfg.get("ollama_url")
     if not ollama_url:
         raise RuntimeError("Missing config key: ollama_url")
+
     models = cfg.get("models") or {}
     embed_model = models.get("embed")
     if not embed_model:
         raise RuntimeError("Missing config key: models.embed")
+
     vs = cfg.get("vector_store") or {}
     if not vs.get("url") or not vs.get("collection"):
         raise RuntimeError("Missing config keys: vector_store.url / vector_store.collection")
+
     ingestion = cfg.get("ingestion") or {}
     batch_size = int(ingestion.get("batch_size", 32))
     strategy = (ingestion.get("chunk_strategy") or "semantic").strip()
+
     limits = cfg.get("limits") or {}
     max_file_bytes = int(limits.get("max_file_bytes", 2_000_000))
 
-    # NEW: cap embedding input size to avoid Ollama 500s on large chunks
-    # (You can tune this later; 12k chars is a safe default)
-    max_embed_chars = int(limits.get("max_embed_chars", 12000))
+    # LOWER this in config if you still see overflows
+    max_embed_chars = int(limits.get("max_embed_chars", 6000))
 
     if "sources" not in cfg or not isinstance(cfg["sources"], list):
         raise RuntimeError("Missing config key: sources (must be a list)")
@@ -148,13 +169,13 @@ def main() -> None:
 
     ollama = OllamaClient(ollama_url)
 
-    # NEW: preflight check embedding model exists locally
+    # preflight check embedding model exists locally (accept base name vs :latest)
     local_models = set(ollama.list_models())
-    if embed_model not in local_models:
+    if embed_model not in local_models and f"{embed_model}:latest" not in local_models:
         raise RuntimeError(
             f"Embedding model '{embed_model}' not found in Ollama.\n"
             f"Local models: {sorted(local_models)}\n"
-            f"Fix: run `ollama pull {embed_model}`"
+            f"Fix: run `ollama pull {embed_model}` (or use ':latest' tag in config)"
         )
 
     store = QdrantStore(vs["url"], vs["collection"])
@@ -193,13 +214,16 @@ def main() -> None:
 
         rel = os.path.relpath(j["path"], j["root"]).replace(os.sep, "/")
 
+        # Build chunks based on file type
         if j["path"].endswith(".pp") and strategy == "semantic":
             chunks = semantic_chunks_pp(text, rel)
+        elif j["path"].endswith(".md") or j["path"].endswith(".markdown"):
+            md_parts = chunk_markdown(text, chunk_size=4000, overlap=200)
+            chunks = [f"File: {rel}\nBlock: md_part\nPart: {i}\n---\n{p}" for i, p in enumerate(md_parts)]
         else:
             chunks = [f"File: {rel}\nBlock: raw\n---\n{text}"]
 
         for idx, ch in enumerate(chunks):
-            # NEW: cap chunk size before embedding
             ch2 = cap_text_for_embedding(ch, max_embed_chars)
 
             try:
